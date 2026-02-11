@@ -1,58 +1,72 @@
 # Local Gate
 
-Local Gate is an Obsidian plugin that lets you switch between multiple local AI profiles and apply the selected profile to Agent Client's Codex configuration.
+Local Gate is an Obsidian plugin that discovers local AI models (Ollama / LM Studio), shows model capabilities, and applies a selected model as a Codex profile for Agent Client.
 
-## What it does
+## Highlights
 
-- Stores multiple local AI profiles (Ollama, LM Studio, OpenAI-compatible local endpoints)
-- Adds a command palette switcher: `Local Gate: Switch Local AI Profile`
-- Writes the selected profile to:
+- Auto-discovery for local models:
+  - Ollama via `ollama list` + `ollama show`
+  - LM Studio via `GET /v1/models`
+- Capability display (for example: `completion`, `tools`, `thinking`)
+- One-click actions from settings:
+  - `Add profile`
+  - `Apply now`
+- Profile switcher from command palette
+- Writes directly to Agent Client Codex config:
   - `.obsidian/plugins/agent-client/data.json`
   - `codex.command`
   - `codex.args`
   - `codex.env`
-- Optionally sets `defaultAgentId` to `codex-acp`
 
 ## Requirements
 
 - Obsidian desktop
 - Agent Client plugin installed (`agent-client`)
-- Codex ACP binary (`codex-acp`) available in PATH or set by full path in profile
+- Codex ACP binary (`codex-acp`) available in PATH or absolute path
+- Optional providers:
+  - Ollama running locally
+  - LM Studio local server running (OpenAI-compatible endpoint)
 
 ## Install with BRAT
 
-1. Install and enable the BRAT plugin in Obsidian.
+1. Install and enable BRAT in Obsidian.
 2. Open **BRAT -> Add a beta plugin**.
-3. Paste your repository URL for this plugin.
+3. Paste this repository URL: `https://github.com/piman-code/local-gate`.
 4. Enable **Local Gate** in Community Plugins.
-
-This repository must contain `manifest.json` and `main.js` at repo root (already included).
 
 ## Commands
 
 - `Local Gate: Switch Local AI Profile`
 - `Local Gate: Apply Last Profile`
+- `Local Gate: Scan Local Models`
 
-## Settings
+## Settings overview
 
-- `Agent Client settings path`: vault-relative path to Agent Client's `data.json`
-- `Profiles JSON`: full editable profile list
-- `Save profile JSON`: validate and save profile list
-- `Reset defaults`: restore bundled profile presets
+- `Scan local models`: refresh discovery list
+- `Scan on startup`: auto-scan when Obsidian starts
+- `Enable Ollama scan` / `Enable LM Studio scan`
+- `Ollama base URL` / `LM Studio base URL`
+- `Codex ACP command`
+- `Discovered Local Models`: add/apply directly
+- `Saved Profiles`: quick apply from saved list
+- `Advanced Profile JSON`: full manual editing
 
 ## Default profiles
 
 - `Ollama: gpt-oss:20b`
-- `Ollama: qwen2.5-coder`
-- `LM Studio: default model`
+- `Ollama: qwen2.5-coder:14b`
+- `LM Studio: local-model`
 
-## Profile format
+## Advanced profile format
 
 ```json
 [
   {
     "id": "ollama-gpt-oss-20b",
     "name": "Ollama: gpt-oss:20b",
+    "provider": "ollama",
+    "endpoint": "http://localhost:11434/v1",
+    "capabilities": ["completion", "tools", "thinking"],
     "command": "codex-acp",
     "args": [
       "-c",
@@ -70,11 +84,13 @@ This repository must contain `manifest.json` and `main.js` at repo root (already
 ]
 ```
 
-## Publish checklist
+## Release checklist
 
-1. Push this repository to GitHub.
-2. Create a release and attach:
+1. Push to GitHub.
+2. Create a release.
+3. Attach:
    - `manifest.json`
    - `main.js`
+   - `styles.css`
    - `versions.json`
-3. Share the repo URL for BRAT users.
+4. BRAT users add repo URL and install.

@@ -1,0 +1,47 @@
+.local-gate-settings .local-gate-subtitle {
+  opacity: 0.85;
+  margin-top: -6px;
+}
+
+.local-gate-settings .local-gate-section {
+  margin: 16px 0;
+  padding: 14px 14px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 12px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--background-primary) 94%, var(--interactive-accent) 6%),
+    var(--background-primary)
+  );
+}
+
+.local-gate-settings .local-gate-section > h3 {
+  margin: 0 0 8px;
+}
+
+.local-gate-settings .local-gate-meta,
+.local-gate-settings .local-gate-empty {
+  margin: 0 0 10px;
+  color: var(--text-muted);
+}
+
+.local-gate-settings .local-gate-model-row,
+.local-gate-settings .local-gate-profile-row {
+  border-left: 3px solid color-mix(in srgb, var(--interactive-accent) 70%, transparent);
+  padding-left: 8px;
+  margin: 6px 0;
+}
+
+.local-gate-suggest-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.local-gate-suggest-title {
+  font-weight: 600;
+}
+
+.local-gate-suggest-meta {
+  opacity: 0.75;
+}
