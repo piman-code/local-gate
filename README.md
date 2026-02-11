@@ -2,6 +2,9 @@
 
 Local Gate is an Obsidian plugin that discovers local AI models (Ollama / LM Studio), shows model capabilities, and publishes them into Agent Client so you can select them from the agent dropdown.
 
+- Korean guide: [`README.ko.md`](README.ko.md)
+- This plugin works by integrating with **Agent Client** (`agent-client`) and syncing local provider settings into Agent Client custom agents.
+
 ## Highlights
 
 - Auto-discovery for local models:
