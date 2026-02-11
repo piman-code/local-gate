@@ -1,0 +1,10 @@
+{
+  "id": "local-gate",
+  "name": "Local Gate",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Switch local AI profiles for Agent Client in Obsidian.",
+  "author": "piman",
+  "authorUrl": "https://github.com/piman",
+  "isDesktopOnly": true
+}
