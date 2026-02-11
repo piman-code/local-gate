@@ -121,6 +121,21 @@ function formatCapabilities(capabilities) {
   return capabilities.join(", ");
 }
 
+function inferModelCapabilities(provider, modelName, currentCapabilities) {
+  const existing = sanitizeStringArray(currentCapabilities);
+  if (existing.length > 0) {
+    return existing;
+  }
+  const lowered = String(modelName || "").toLowerCase();
+  if (lowered.includes("embed")) {
+    return ["embedding"];
+  }
+  if (provider === "ollama" || provider === "lmstudio") {
+    return ["completion"];
+  }
+  return [];
+}
+
 function buildExecPathEnv() {
   const existing = sanitizeString(process.env.PATH, "");
   const parts = existing.length > 0 ? existing.split(":") : [];
@@ -242,17 +257,6 @@ function defaultProfiles() {
       capabilities: ["completion", "tools"],
       command: "codex-acp",
       args: buildLocalCodexArgs("qwen2.5-coder:14b", toOpenAiEndpoint("ollama", OLLAMA_DEFAULT_BASE_URL)),
-      env: [],
-      setAsDefaultAgent: true,
-    },
-    {
-      id: "lmstudio-local-model",
-      name: "LM Studio: local-model",
-      provider: "lmstudio",
-      endpoint: toOpenAiEndpoint("lmstudio", LMSTUDIO_DEFAULT_BASE_URL),
-      capabilities: ["completion"],
-      command: "codex-acp",
-      args: buildLocalCodexArgs("local-model", toOpenAiEndpoint("lmstudio", LMSTUDIO_DEFAULT_BASE_URL)),
       env: [],
       setAsDefaultAgent: true,
     },
@@ -702,6 +706,7 @@ class LocalGateSettingTab extends PluginSettingTab {
 class LocalGatePlugin extends Plugin {
   async onload() {
     await this.loadSettings();
+    await this.ensureBuiltinAgentsHealthy();
 
     this.addCommand({
       id: "local-gate-switch-profile",
@@ -736,6 +741,9 @@ class LocalGatePlugin extends Plugin {
     this.addSettingTab(new LocalGateSettingTab(this.app, this));
 
     this.app.workspace.onLayoutReady(async () => {
+      if (this.settings.publishProfilesToAgentClient) {
+        await this.syncProfilesToAgentClientAgents(true);
+      }
       if (this.settings.scanOnStartup) {
         await this.scanAndStoreModels({ silent: true });
       }
@@ -783,6 +791,39 @@ class LocalGatePlugin extends Plugin {
       lastScanSummary: sanitizeString(loaded.lastScanSummary, ""),
       lastScanErrors: sanitizeStringArray(loaded.lastScanErrors),
     };
+
+    this.settings.profiles = this.settings.profiles
+      .map((profile) => {
+        const migrated = { ...profile };
+        if (migrated.provider === "local") {
+          if (String(migrated.name || "").toLowerCase().includes("lm studio")) {
+            migrated.provider = "lmstudio";
+          } else {
+            migrated.provider = "ollama";
+          }
+        }
+        if (!sanitizeString(migrated.endpoint, "")) {
+          migrated.endpoint =
+            migrated.provider === "lmstudio"
+              ? toOpenAiEndpoint("lmstudio", this.settings.lmStudioBaseUrl)
+              : toOpenAiEndpoint("ollama", this.settings.ollamaBaseUrl);
+        }
+        migrated.command = sanitizeString(migrated.command, this.settings.codexAcpCommand || "codex-acp");
+        migrated.capabilities = inferModelCapabilities(
+          migrated.provider,
+          migrated.name,
+          sanitizeStringArray(migrated.capabilities)
+        );
+        return sanitizeProfile(migrated, 0);
+      })
+      .filter((profile) => !(profile.id === "lmstudio-default" || profile.id === "lmstudio-local-model"));
+
+    if (this.settings.profiles.length === 0) {
+      this.settings.profiles = defaultProfiles();
+    }
+    if (!this.settings.profiles.find((profile) => profile.id === this.settings.lastProfileId)) {
+      this.settings.lastProfileId = this.settings.profiles[0].id;
+    }
   }
 
   async saveSettings() {
@@ -822,41 +863,106 @@ class LocalGatePlugin extends Plugin {
     return sanitizeString(resolved, command);
   }
 
-  async applyProfile(profile) {
-    const normalized = sanitizeProfile(profile, 0);
-    const codexCommand = await this.resolveCodexCommand(normalized.command);
+  async resolveNodeCommand() {
+    const resolved = await resolveExecutable("node", [
+      "/opt/homebrew/bin/node",
+      "/usr/local/bin/node",
+      "/usr/bin/node",
+    ]);
+    return sanitizeString(resolved, "node");
+  }
+
+  async buildCodexAcpLaunchSpec(preferredCommand) {
+    const codexCommand = await this.resolveCodexCommand(preferredCommand);
+    let codexRealPath = codexCommand;
+    try {
+      codexRealPath = fs.realpathSync(codexCommand);
+    } catch (_error) {
+    }
+
+    const nodeCommand = await this.resolveNodeCommand();
+    if (pathExists(codexRealPath) && codexRealPath.endsWith(".js") && pathExists(nodeCommand)) {
+      return {
+        command: nodeCommand,
+        argsPrefix: [codexRealPath],
+        nodePath: nodeCommand,
+        codexPath: codexRealPath,
+      };
+    }
+
+    return {
+      command: codexCommand,
+      argsPrefix: [],
+      nodePath: pathExists(nodeCommand) ? nodeCommand : "",
+      codexPath: codexCommand,
+    };
+  }
+
+  toLocalGateAgentId(profile) {
+    return `local-gate-${slugify(profile.id) || slugify(profile.name)}`;
+  }
+
+  isLocalOverrideArgs(args) {
+    return sanitizeStringArray(args).some((arg) =>
+      arg.includes("model_provider=\"local\"") || arg.includes("model_providers.local")
+    );
+  }
+
+  async ensureBuiltinAgentsHealthy() {
     const path = normalizePath(this.settings.agentClientSettingsPath);
     const data = await this.readOrCreateAgentClientSettings(path);
+    const launch = await this.buildCodexAcpLaunchSpec(this.settings.codexAcpCommand || "codex-acp");
+    const codex = data.codex || {};
+    const wasLocalOverride = this.isLocalOverrideArgs(codex.args);
 
-    const existingCodex = data.codex || {};
-    data.codex = {
-      id: sanitizeString(existingCodex.id, "codex-acp"),
-      displayName: sanitizeString(existingCodex.displayName, "Codex"),
-      apiKey: sanitizeString(existingCodex.apiKey, ""),
-      command: codexCommand,
-      args: sanitizeStringArray(normalized.args),
-      env: sanitizeStringArray(normalized.env),
+    let changed = false;
+    const nextCodex = {
+      id: sanitizeString(codex.id, "codex-acp"),
+      displayName: sanitizeString(codex.displayName, "Codex"),
+      apiKey: sanitizeString(codex.apiKey, ""),
+      command: launch.command,
+      args: [...launch.argsPrefix],
+      env: sanitizeStringArray(codex.env),
     };
 
-    if (normalized.setAsDefaultAgent !== false) {
-      data.defaultAgentId = data.codex.id || "codex-acp";
+    if (JSON.stringify(nextCodex) !== JSON.stringify(codex)) {
+      data.codex = nextCodex;
+      changed = true;
     }
 
-    await this.app.vault.adapter.write(path, `${JSON.stringify(data, null, 2)}\n`);
+    if (launch.nodePath && sanitizeString(data.nodePath, "") !== launch.nodePath) {
+      data.nodePath = launch.nodePath;
+      changed = true;
+    }
 
-    this.settings.lastProfileId = normalized.id;
-    this.settings.codexAcpCommand = codexCommand;
+    if (changed) {
+      await this.app.vault.adapter.write(path, `${JSON.stringify(data, null, 2)}\n`);
+      if (wasLocalOverride) {
+        new Notice("Local Gate: restored built-in Codex to default (cloud) mode.");
+      }
+    }
+
+    this.settings.codexAcpCommand = launch.codexPath;
+    await this.saveSettings();
+  }
+
+  async applyProfile(profile) {
+    const normalized = sanitizeProfile(profile, 0);
+    const saved = this.upsertProfile(normalized);
+    this.settings.lastProfileId = saved.id;
     await this.saveSettings();
 
-    if (!pathExists(codexCommand) && codexCommand === "codex-acp") {
-      new Notice("Local Gate: codex-acp path unresolved. Set absolute path in Codex ACP command.");
+    const preferredAgentId = this.toLocalGateAgentId(saved);
+    if (this.settings.publishProfilesToAgentClient) {
+      await this.syncProfilesToAgentClientAgents(true, preferredAgentId);
     } else {
-      new Notice(`Local Gate: applied "${normalized.name}".`);
+      const path = normalizePath(this.settings.agentClientSettingsPath);
+      const data = await this.readOrCreateAgentClientSettings(path);
+      data.defaultAgentId = preferredAgentId;
+      await this.app.vault.adapter.write(path, `${JSON.stringify(data, null, 2)}\n`);
     }
 
-    if (this.settings.publishProfilesToAgentClient) {
-      await this.syncProfilesToAgentClientAgents(true);
-    }
+    new Notice(`Local Gate: applied "${saved.name}" as active local agent.`);
   }
 
   async deleteProfile(profileId) {
@@ -895,7 +1001,7 @@ class LocalGatePlugin extends Plugin {
       name: `${providerLabel(provider)}: ${modelName}`,
       provider,
       endpoint,
-      capabilities: sanitizeStringArray(model.capabilities),
+      capabilities: inferModelCapabilities(provider, modelName, sanitizeStringArray(model.capabilities)),
       command: this.settings.codexAcpCommand || "codex-acp",
       args: buildLocalCodexArgs(modelName, endpoint),
       env: [],
@@ -990,7 +1096,10 @@ class LocalGatePlugin extends Plugin {
       }
     }
 
-    this.settings.discoveredModels = normalizeDiscoveredModels(found);
+    this.settings.discoveredModels = normalizeDiscoveredModels(found).map((model) => ({
+      ...model,
+      capabilities: inferModelCapabilities(model.provider, model.model, model.capabilities),
+    }));
     this.settings.lastScanErrors = errors;
     this.settings.lastScanAt = new Date().toLocaleString();
     this.settings.lastScanSummary = `Discovered ${this.settings.discoveredModels.length} model(s).`;
@@ -999,6 +1108,18 @@ class LocalGatePlugin extends Plugin {
       this.settings.discoveredModels.forEach((model) => {
         const profile = this.createProfileFromDiscovered(model);
         this.upsertProfile(profile);
+      });
+    }
+
+    const hasLmStudioModel = this.settings.discoveredModels.some((model) => model.provider === "lmstudio");
+    const lmStudioErrored = errors.some((entry) => entry.startsWith("LM Studio:"));
+    if (!hasLmStudioModel && lmStudioErrored) {
+      this.settings.profiles = this.settings.profiles.filter((profile) => {
+        if (profile.provider !== "lmstudio") {
+          return true;
+        }
+        const lowered = `${profile.id} ${profile.name}`.toLowerCase();
+        return !lowered.includes("default");
       });
     }
 
@@ -1057,7 +1178,7 @@ class LocalGatePlugin extends Plugin {
           provider: "ollama",
           model: name,
           endpoint,
-          capabilities,
+          capabilities: inferModelCapabilities("ollama", name, capabilities),
           contextLength,
         });
       }
@@ -1115,7 +1236,7 @@ class LocalGatePlugin extends Plugin {
         provider: "ollama",
         model: modelName,
         endpoint,
-        capabilities,
+        capabilities: inferModelCapabilities("ollama", modelName, capabilities),
         contextLength,
       });
     }
@@ -1160,22 +1281,34 @@ class LocalGatePlugin extends Plugin {
     throw new Error(lastError || "LM Studio endpoint not reachable");
   }
 
-  async syncProfilesToAgentClientAgents(silent = false) {
+  async syncProfilesToAgentClientAgents(silent = false, preferredDefaultAgentId = "") {
     const path = normalizePath(this.settings.agentClientSettingsPath);
     const data = await this.readOrCreateAgentClientSettings(path);
     const customAgents = Array.isArray(data.customAgents) ? data.customAgents : [];
     const kept = customAgents.filter((agent) => !String(agent && agent.id || "").startsWith("local-gate-"));
 
-    const codexCommand = await this.resolveCodexCommand(this.settings.codexAcpCommand || "codex-acp");
-    const generated = this.settings.profiles.map((profile) => ({
-      id: `local-gate-${slugify(profile.id) || slugify(profile.name)}`,
-      displayName: `[Local] ${profile.name}`,
-      command: codexCommand,
-      args: sanitizeStringArray(profile.args),
-      env: sanitizeStringArray(profile.env),
-    }));
+    const launch = await this.buildCodexAcpLaunchSpec(this.settings.codexAcpCommand || "codex-acp");
+    const generated = this.settings.profiles.map((profile) => {
+      const baseEnv = sanitizeStringArray(profile.env);
+      if (!baseEnv.some((entry) => entry.startsWith("PATH="))) {
+        baseEnv.unshift(`PATH=${buildExecPathEnv()}`);
+      }
+      return {
+        id: this.toLocalGateAgentId(profile),
+        displayName: `[Local] ${profile.name}`,
+        command: launch.command,
+        args: [...launch.argsPrefix, ...sanitizeStringArray(profile.args)],
+        env: baseEnv,
+      };
+    });
 
     data.customAgents = [...kept, ...generated];
+    if (preferredDefaultAgentId && generated.some((agent) => agent.id === preferredDefaultAgentId)) {
+      data.defaultAgentId = preferredDefaultAgentId;
+    }
+    if (launch.nodePath) {
+      data.nodePath = launch.nodePath;
+    }
     await this.app.vault.adapter.write(path, `${JSON.stringify(data, null, 2)}\n`);
 
     if (!silent) {

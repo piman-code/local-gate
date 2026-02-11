@@ -17,6 +17,7 @@ Local Gate is an Obsidian plugin that discovers local AI models (Ollama / LM Stu
 - Agent Client integration:
   - Sync profiles as `customAgents` entries
   - Select each local model directly in Agent Client UI
+  - Keep built-in Claude/Codex/Gemini settings stable (Local Gate only manages local custom agents)
 - Profile switcher from command palette
 - Writes directly to Agent Client Codex config:
   - `.obsidian/plugins/agent-client/data.json`
