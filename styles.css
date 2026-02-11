@@ -25,6 +25,11 @@
   color: var(--text-muted);
 }
 
+.local-gate-settings .local-gate-error {
+  margin: 0 0 10px;
+  color: var(--text-error);
+}
+
 .local-gate-settings .local-gate-model-row,
 .local-gate-settings .local-gate-profile-row {
   border-left: 3px solid color-mix(in srgb, var(--interactive-accent) 70%, transparent);

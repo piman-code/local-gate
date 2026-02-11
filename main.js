@@ -10,59 +10,19 @@ const {
   requestUrl,
 } = require("obsidian");
 const { execFile } = require("child_process");
+const fs = require("fs");
 
-const OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434/v1";
+const OLLAMA_DEFAULT_BASE_URL = "http://127.0.0.1:11434";
 const LMSTUDIO_DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1";
 
-const DEFAULT_PROFILES = [
-  {
-    id: "ollama-gpt-oss-20b",
-    name: "Ollama: gpt-oss:20b",
-    provider: "ollama",
-    endpoint: OLLAMA_DEFAULT_BASE_URL,
-    capabilities: ["completion", "tools", "thinking"],
-    command: "codex-acp",
-    args: buildLocalCodexArgs("gpt-oss:20b", OLLAMA_DEFAULT_BASE_URL),
-    env: [],
-    setAsDefaultAgent: true,
-  },
-  {
-    id: "ollama-qwen2-5-coder-14b",
-    name: "Ollama: qwen2.5-coder:14b",
-    provider: "ollama",
-    endpoint: OLLAMA_DEFAULT_BASE_URL,
-    capabilities: ["completion", "tools"],
-    command: "codex-acp",
-    args: buildLocalCodexArgs("qwen2.5-coder:14b", OLLAMA_DEFAULT_BASE_URL),
-    env: [],
-    setAsDefaultAgent: true,
-  },
-  {
-    id: "lmstudio-local-model",
-    name: "LM Studio: local-model",
-    provider: "lmstudio",
-    endpoint: LMSTUDIO_DEFAULT_BASE_URL,
-    capabilities: ["completion"],
-    command: "codex-acp",
-    args: buildLocalCodexArgs("local-model", LMSTUDIO_DEFAULT_BASE_URL),
-    env: [],
-    setAsDefaultAgent: true,
-  },
-];
-
-const DEFAULT_SETTINGS = {
-  agentClientSettingsPath: ".obsidian/plugins/agent-client/data.json",
-  codexAcpCommand: "codex-acp",
-  profiles: DEFAULT_PROFILES,
-  lastProfileId: "ollama-gpt-oss-20b",
-  discoveredModels: [],
-  scanOnStartup: true,
-  enableOllamaScan: true,
-  enableLmStudioScan: true,
-  ollamaBaseUrl: OLLAMA_DEFAULT_BASE_URL,
-  lmStudioBaseUrl: LMSTUDIO_DEFAULT_BASE_URL,
-  lastScanAt: "",
-};
+const COMMON_BIN_PATHS = [
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+  "/usr/bin",
+  "/bin",
+  `${process.env.HOME || ""}/.local/bin`,
+  `${process.env.HOME || ""}/bin`,
+].filter((item) => item.length > 0);
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
@@ -80,7 +40,7 @@ function sanitizeStringArray(value) {
   if (!Array.isArray(value)) {
     return [];
   }
-  return value.filter((entry) => typeof entry === "string");
+  return value.filter((entry) => typeof entry === "string").map((entry) => entry.trim()).filter(Boolean);
 }
 
 function slugify(input) {
@@ -96,7 +56,42 @@ function toTomlQuoted(value) {
   return `"${escaped}"`;
 }
 
-function buildLocalCodexArgs(model, baseUrl) {
+function ensureNoTrailingSlash(value) {
+  return String(value || "").replace(/\/+$/, "");
+}
+
+function normalizeOllamaBaseUrl(rawUrl) {
+  const fallback = OLLAMA_DEFAULT_BASE_URL;
+  let value = sanitizeString(rawUrl, fallback);
+  value = ensureNoTrailingSlash(value);
+  if (value.endsWith("/v1")) {
+    value = value.slice(0, -3);
+  }
+  return value;
+}
+
+function normalizeLmStudioBaseUrl(rawUrl) {
+  const fallback = LMSTUDIO_DEFAULT_BASE_URL;
+  let value = sanitizeString(rawUrl, fallback);
+  value = ensureNoTrailingSlash(value);
+  if (!value.endsWith("/v1")) {
+    value = `${value}/v1`;
+  }
+  return value;
+}
+
+function toOpenAiEndpoint(provider, configuredBaseUrl) {
+  if (provider === "ollama") {
+    const base = normalizeOllamaBaseUrl(configuredBaseUrl);
+    return `${base}/v1`;
+  }
+  if (provider === "lmstudio") {
+    return normalizeLmStudioBaseUrl(configuredBaseUrl);
+  }
+  return sanitizeString(configuredBaseUrl, "");
+}
+
+function buildLocalCodexArgs(model, openAiBaseUrl) {
   return [
     "-c",
     "model_provider=\"local\"",
@@ -105,15 +100,8 @@ function buildLocalCodexArgs(model, baseUrl) {
     "-c",
     "model_providers.local.name=\"local\"",
     "-c",
-    `model_providers.local.base_url=${toTomlQuoted(baseUrl)}`,
+    `model_providers.local.base_url=${toTomlQuoted(openAiBaseUrl)}`,
   ];
-}
-
-function formatCapabilities(capabilities) {
-  if (!Array.isArray(capabilities) || capabilities.length === 0) {
-    return "unknown";
-  }
-  return capabilities.join(", ");
 }
 
 function providerLabel(provider) {
@@ -126,36 +114,172 @@ function providerLabel(provider) {
   return "Local";
 }
 
+function formatCapabilities(capabilities) {
+  if (!Array.isArray(capabilities) || capabilities.length === 0) {
+    return "unknown";
+  }
+  return capabilities.join(", ");
+}
+
+function buildExecPathEnv() {
+  const existing = sanitizeString(process.env.PATH, "");
+  const parts = existing.length > 0 ? existing.split(":") : [];
+  const merged = [...new Set([...COMMON_BIN_PATHS, ...parts])];
+  return merged.join(":");
+}
+
+function pathExists(filePath) {
+  try {
+    return fs.existsSync(filePath);
+  } catch (_error) {
+    return false;
+  }
+}
+
+function runCommand(command, args, timeoutMs = 8000, extraEnv = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      command,
+      args,
+      {
+        timeout: timeoutMs,
+        maxBuffer: 4 * 1024 * 1024,
+        env: {
+          ...process.env,
+          ...extraEnv,
+          PATH: buildExecPathEnv(),
+        },
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          const message = sanitizeString(stderr, error.message || "Command failed");
+          reject(new Error(message));
+          return;
+        }
+        resolve(stdout || "");
+      }
+    );
+  });
+}
+
+async function resolveExecutable(rawCommand, fallbacks = []) {
+  const command = sanitizeString(rawCommand, "");
+  if (command.length === 0) {
+    return "";
+  }
+
+  if (command.includes("/") && pathExists(command)) {
+    return command;
+  }
+
+  for (const entry of fallbacks) {
+    if (pathExists(entry)) {
+      return entry;
+    }
+  }
+
+  try {
+    const output = await runCommand("/usr/bin/which", [command], 3000);
+    const found = sanitizeString(output.split(/\r?\n/)[0], "");
+    if (found.length > 0 && pathExists(found)) {
+      return found;
+    }
+  } catch (_error) {
+  }
+
+  return command;
+}
+
 function parseOllamaShow(showOutput) {
-  const lines = showOutput.split(/\r?\n/);
+  const lines = String(showOutput || "").split(/\r?\n/);
   const capabilities = [];
   let contextLength = "";
-  let currentSection = "";
+  let section = "";
 
-  lines.forEach((line) => {
-    if (/^\s{2}[A-Za-z][A-Za-z ]+$/.test(line)) {
-      currentSection = line.trim().toLowerCase();
-      return;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) {
+      continue;
     }
 
-    if (!/^\s{4}\S/.test(line)) {
-      return;
+    if (/^[A-Za-z][A-Za-z ]+$/.test(trimmed)) {
+      section = trimmed.toLowerCase();
+      continue;
     }
 
-    const content = line.trim();
-
-    if (currentSection === "capabilities") {
-      capabilities.push(content);
-      return;
+    if (section === "capabilities") {
+      capabilities.push(trimmed);
+      continue;
     }
 
-    if (currentSection === "model" && content.startsWith("context length")) {
-      const parts = content.split(/\s+/);
-      contextLength = parts[parts.length - 1] || "";
+    if (section === "model" && /^context length\s+/i.test(trimmed)) {
+      const tail = trimmed.replace(/^context length\s+/i, "").trim();
+      contextLength = tail;
     }
-  });
+  }
 
   return { capabilities, contextLength };
+}
+
+function defaultProfiles() {
+  return [
+    {
+      id: "ollama-gpt-oss-20b",
+      name: "Ollama: gpt-oss:20b",
+      provider: "ollama",
+      endpoint: toOpenAiEndpoint("ollama", OLLAMA_DEFAULT_BASE_URL),
+      capabilities: ["completion", "tools", "thinking"],
+      command: "codex-acp",
+      args: buildLocalCodexArgs("gpt-oss:20b", toOpenAiEndpoint("ollama", OLLAMA_DEFAULT_BASE_URL)),
+      env: [],
+      setAsDefaultAgent: true,
+    },
+    {
+      id: "ollama-qwen2-5-coder-14b",
+      name: "Ollama: qwen2.5-coder:14b",
+      provider: "ollama",
+      endpoint: toOpenAiEndpoint("ollama", OLLAMA_DEFAULT_BASE_URL),
+      capabilities: ["completion", "tools"],
+      command: "codex-acp",
+      args: buildLocalCodexArgs("qwen2.5-coder:14b", toOpenAiEndpoint("ollama", OLLAMA_DEFAULT_BASE_URL)),
+      env: [],
+      setAsDefaultAgent: true,
+    },
+    {
+      id: "lmstudio-local-model",
+      name: "LM Studio: local-model",
+      provider: "lmstudio",
+      endpoint: toOpenAiEndpoint("lmstudio", LMSTUDIO_DEFAULT_BASE_URL),
+      capabilities: ["completion"],
+      command: "codex-acp",
+      args: buildLocalCodexArgs("local-model", toOpenAiEndpoint("lmstudio", LMSTUDIO_DEFAULT_BASE_URL)),
+      env: [],
+      setAsDefaultAgent: true,
+    },
+  ];
+}
+
+function defaultSettings() {
+  const profiles = defaultProfiles();
+  return {
+    agentClientSettingsPath: ".obsidian/plugins/agent-client/data.json",
+    codexAcpCommand: "codex-acp",
+    ollamaCommand: "ollama",
+    profiles,
+    lastProfileId: profiles[0].id,
+    discoveredModels: [],
+    scanOnStartup: true,
+    enableOllamaScan: true,
+    enableLmStudioScan: true,
+    ollamaBaseUrl: OLLAMA_DEFAULT_BASE_URL,
+    lmStudioBaseUrl: LMSTUDIO_DEFAULT_BASE_URL,
+    publishProfilesToAgentClient: true,
+    autoCreateProfilesFromDiscovery: true,
+    autoSyncToAgentClientAfterScan: true,
+    lastScanAt: "",
+    lastScanSummary: "",
+    lastScanErrors: [],
+  };
 }
 
 function sanitizeProfile(rawProfile, index) {
@@ -184,38 +308,32 @@ function sanitizeProfile(rawProfile, index) {
 }
 
 function normalizeProfiles(rawProfiles) {
-  const source = Array.isArray(rawProfiles) && rawProfiles.length > 0 ? rawProfiles : DEFAULT_PROFILES;
-  const seenIds = new Set();
+  const defaults = defaultProfiles();
+  const source = Array.isArray(rawProfiles) && rawProfiles.length > 0 ? rawProfiles : defaults;
+  const seen = new Set();
   const result = [];
 
   source.forEach((rawProfile, index) => {
-    const sanitized = sanitizeProfile(rawProfile, index);
-    if (seenIds.has(sanitized.id)) {
+    const profile = sanitizeProfile(rawProfile, index);
+    if (seen.has(profile.id)) {
       return;
     }
-    seenIds.add(sanitized.id);
-    result.push(sanitized);
+    seen.add(profile.id);
+    result.push(profile);
   });
 
-  return result.length > 0 ? result : clone(DEFAULT_PROFILES);
+  return result.length > 0 ? result : defaults;
 }
 
 function sanitizeDiscoveredModel(rawModel, index) {
   const fallbackKey = `model-${index + 1}`;
-  const key = sanitizeString(rawModel && rawModel.key, fallbackKey);
-  const provider = sanitizeString(rawModel && rawModel.provider, "local");
-  const model = sanitizeString(rawModel && rawModel.model, "unknown");
-  const endpoint = sanitizeString(rawModel && rawModel.endpoint, "");
-  const capabilities = sanitizeStringArray(rawModel && rawModel.capabilities);
-  const contextLength = sanitizeString(rawModel && rawModel.contextLength, "");
-
   return {
-    key,
-    provider,
-    model,
-    endpoint,
-    capabilities,
-    contextLength,
+    key: sanitizeString(rawModel && rawModel.key, fallbackKey),
+    provider: sanitizeString(rawModel && rawModel.provider, "local"),
+    model: sanitizeString(rawModel && rawModel.model, "unknown"),
+    endpoint: sanitizeString(rawModel && rawModel.endpoint, ""),
+    capabilities: sanitizeStringArray(rawModel && rawModel.capabilities),
+    contextLength: sanitizeString(rawModel && rawModel.contextLength, ""),
   };
 }
 
@@ -225,8 +343,8 @@ function normalizeDiscoveredModels(rawModels) {
   }
   const seen = new Set();
   const result = [];
-  rawModels.forEach((rawModel, index) => {
-    const item = sanitizeDiscoveredModel(rawModel, index);
+  rawModels.forEach((entry, index) => {
+    const item = sanitizeDiscoveredModel(entry, index);
     if (seen.has(item.key)) {
       return;
     }
@@ -234,27 +352,6 @@ function normalizeDiscoveredModels(rawModels) {
     result.push(item);
   });
   return result;
-}
-
-function runCommand(command, args, timeoutMs = 6000) {
-  return new Promise((resolve, reject) => {
-    execFile(
-      command,
-      args,
-      {
-        timeout: timeoutMs,
-        maxBuffer: 2 * 1024 * 1024,
-      },
-      (error, stdout, stderr) => {
-        if (error) {
-          const message = sanitizeString(stderr, error.message || "Command failed");
-          reject(new Error(message));
-          return;
-        }
-        resolve(stdout || "");
-      }
-    );
-  });
 }
 
 class ProfileSuggestModal extends SuggestModal {
@@ -274,8 +371,7 @@ class ProfileSuggestModal extends SuggestModal {
       return (
         profile.name.toLowerCase().includes(lowered) ||
         profile.id.toLowerCase().includes(lowered) ||
-        profile.provider.toLowerCase().includes(lowered) ||
-        profile.command.toLowerCase().includes(lowered)
+        profile.provider.toLowerCase().includes(lowered)
       );
     });
   }
@@ -284,7 +380,9 @@ class ProfileSuggestModal extends SuggestModal {
     const row = el.createDiv({ cls: "local-gate-suggest-row" });
     row.createEl("div", { text: profile.name, cls: "local-gate-suggest-title" });
     row.createEl("small", {
-      text: `${providerLabel(profile.provider)} | ${profile.id} | ${formatCapabilities(profile.capabilities)}`,
+      text: `${providerLabel(profile.provider)} | ${profile.id} | capabilities: ${formatCapabilities(
+        profile.capabilities
+      )}`,
       cls: "local-gate-suggest-meta",
     });
   }
@@ -307,23 +405,23 @@ class LocalGateSettingTab extends PluginSettingTab {
 
     containerEl.createEl("h2", { text: "Local Gate" });
     containerEl.createEl("p", {
-      text: "Detect local AI models, show capabilities, and apply one click to Agent Client Codex settings.",
+      text: "Discover local models, show capabilities, and publish them into Agent Client.",
       cls: "local-gate-subtitle",
     });
 
-    const quickActionsSection = containerEl.createDiv({ cls: "local-gate-section" });
-    quickActionsSection.createEl("h3", { text: "Quick Actions" });
+    const quickSection = containerEl.createDiv({ cls: "local-gate-section" });
+    quickSection.createEl("h3", { text: "Quick Actions" });
 
-    new Setting(quickActionsSection)
+    new Setting(quickSection)
       .setName("Profile switcher")
-      .setDesc("Open interactive picker")
+      .setDesc("Open interactive profile picker")
       .addButton((button) =>
         button.setButtonText("Open").setCta().onClick(() => {
           this.plugin.openProfileSwitcher();
         })
       );
 
-    new Setting(quickActionsSection)
+    new Setting(quickSection)
       .setName("Apply last profile")
       .setDesc(`Current: ${this.plugin.settings.lastProfileId || "(none)"}`)
       .addButton((button) =>
@@ -332,18 +430,39 @@ class LocalGateSettingTab extends PluginSettingTab {
         })
       );
 
+    new Setting(quickSection)
+      .setName("Sync to Agent Client")
+      .setDesc("Publish saved profiles as Agent Client custom agents")
+      .addButton((button) =>
+        button.setButtonText("Sync").setCta().onClick(async () => {
+          await this.plugin.syncProfilesToAgentClientAgents();
+        })
+      );
+
     const scanSection = containerEl.createDiv({ cls: "local-gate-section" });
     scanSection.createEl("h3", { text: "Discovery" });
     scanSection.createEl("p", {
       text: this.plugin.settings.lastScanAt
         ? `Last scan: ${this.plugin.settings.lastScanAt}`
-        : "No scan yet. Click Scan now.",
+        : "No scan yet.",
       cls: "local-gate-meta",
     });
+    if (this.plugin.settings.lastScanSummary) {
+      scanSection.createEl("p", {
+        text: this.plugin.settings.lastScanSummary,
+        cls: "local-gate-meta",
+      });
+    }
+    if (this.plugin.settings.lastScanErrors.length > 0) {
+      scanSection.createEl("p", {
+        text: `Errors: ${this.plugin.settings.lastScanErrors.join(" | ")}`,
+        cls: "local-gate-error",
+      });
+    }
 
     new Setting(scanSection)
       .setName("Scan local models")
-      .setDesc("Detect models from configured local providers")
+      .setDesc("Detect models from enabled providers")
       .addButton((button) =>
         button.setButtonText("Scan now").setCta().onClick(async () => {
           await this.plugin.scanAndStoreModels({ silent: false });
@@ -353,7 +472,7 @@ class LocalGateSettingTab extends PluginSettingTab {
 
     new Setting(scanSection)
       .setName("Scan on startup")
-      .setDesc("Automatically refresh model list when Obsidian starts")
+      .setDesc("Refresh model list when Obsidian starts")
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.scanOnStartup).onChange(async (value) => {
           this.plugin.settings.scanOnStartup = value;
@@ -363,7 +482,7 @@ class LocalGateSettingTab extends PluginSettingTab {
 
     new Setting(scanSection)
       .setName("Enable Ollama scan")
-      .setDesc("Use `ollama list` and `ollama show`")
+      .setDesc("Use CLI first, HTTP fallback next")
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.enableOllamaScan).onChange(async (value) => {
           this.plugin.settings.enableOllamaScan = value;
@@ -373,7 +492,7 @@ class LocalGateSettingTab extends PluginSettingTab {
 
     new Setting(scanSection)
       .setName("Enable LM Studio scan")
-      .setDesc("Use OpenAI-compatible endpoint /v1/models")
+      .setDesc("Query OpenAI-compatible /models endpoint")
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.enableLmStudioScan).onChange(async (value) => {
           this.plugin.settings.enableLmStudioScan = value;
@@ -382,14 +501,40 @@ class LocalGateSettingTab extends PluginSettingTab {
       );
 
     new Setting(scanSection)
+      .setName("Ollama command")
+      .setDesc("Path or command for Ollama CLI")
+      .addText((text) =>
+        text
+          .setPlaceholder("ollama")
+          .setValue(this.plugin.settings.ollamaCommand)
+          .onChange(async (value) => {
+            this.plugin.settings.ollamaCommand = sanitizeString(value, "ollama");
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(scanSection)
+      .setName("Codex ACP command")
+      .setDesc("Path or command for codex-acp")
+      .addText((text) =>
+        text
+          .setPlaceholder("codex-acp")
+          .setValue(this.plugin.settings.codexAcpCommand)
+          .onChange(async (value) => {
+            this.plugin.settings.codexAcpCommand = sanitizeString(value, "codex-acp");
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(scanSection)
       .setName("Ollama base URL")
-      .setDesc("Example: http://localhost:11434/v1")
+      .setDesc("Example: http://127.0.0.1:11434")
       .addText((text) =>
         text
           .setPlaceholder(OLLAMA_DEFAULT_BASE_URL)
           .setValue(this.plugin.settings.ollamaBaseUrl)
           .onChange(async (value) => {
-            this.plugin.settings.ollamaBaseUrl = sanitizeString(value, OLLAMA_DEFAULT_BASE_URL);
+            this.plugin.settings.ollamaBaseUrl = normalizeOllamaBaseUrl(value);
             await this.plugin.saveSettings();
           })
       );
@@ -402,35 +547,48 @@ class LocalGateSettingTab extends PluginSettingTab {
           .setPlaceholder(LMSTUDIO_DEFAULT_BASE_URL)
           .setValue(this.plugin.settings.lmStudioBaseUrl)
           .onChange(async (value) => {
-            this.plugin.settings.lmStudioBaseUrl = sanitizeString(value, LMSTUDIO_DEFAULT_BASE_URL);
+            this.plugin.settings.lmStudioBaseUrl = normalizeLmStudioBaseUrl(value);
             await this.plugin.saveSettings();
           })
       );
 
     new Setting(scanSection)
-      .setName("Codex ACP command")
-      .setDesc("Path or command used for applied profiles")
-      .addText((text) =>
-        text
-          .setPlaceholder("codex-acp")
-          .setValue(this.plugin.settings.codexAcpCommand)
-          .onChange(async (value) => {
-            this.plugin.settings.codexAcpCommand = sanitizeString(value, "codex-acp");
-            await this.plugin.saveSettings();
-          })
+      .setName("Auto-create profiles from discovered models")
+      .setDesc("Save newly discovered models into Saved Profiles")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.autoCreateProfilesFromDiscovery).onChange(async (value) => {
+          this.plugin.settings.autoCreateProfilesFromDiscovery = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(scanSection)
+      .setName("Publish profiles to Agent Client")
+      .setDesc("Show local models in Agent Client agent dropdown")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.publishProfilesToAgentClient).onChange(async (value) => {
+          this.plugin.settings.publishProfilesToAgentClient = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(scanSection)
+      .setName("Auto-sync after scan")
+      .setDesc("Sync profiles into Agent Client right after scanning")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.autoSyncToAgentClientAfterScan).onChange(async (value) => {
+          this.plugin.settings.autoSyncToAgentClientAfterScan = value;
+          await this.plugin.saveSettings();
+        })
       );
 
     const discoveredSection = containerEl.createDiv({ cls: "local-gate-section" });
     discoveredSection.createEl("h3", { text: "Discovered Local Models" });
-
     if (this.plugin.settings.discoveredModels.length === 0) {
-      discoveredSection.createEl("p", {
-        text: "No discovered models yet.",
-        cls: "local-gate-empty",
-      });
+      discoveredSection.createEl("p", { text: "No models discovered yet.", cls: "local-gate-empty" });
     } else {
       this.plugin.settings.discoveredModels.forEach((model) => {
-        const setting = new Setting(discoveredSection)
+        const row = new Setting(discoveredSection)
           .setName(`${providerLabel(model.provider)}: ${model.model}`)
           .setDesc(
             `${model.endpoint} | capabilities: ${formatCapabilities(model.capabilities)}${
@@ -444,19 +602,18 @@ class LocalGateSettingTab extends PluginSettingTab {
             })
           )
           .addButton((button) =>
-            button.setButtonText("Apply now").setCta().onClick(async () => {
+            button.setButtonText("Apply").setCta().onClick(async () => {
               await this.plugin.applyDiscoveredModel(model);
             })
           );
-        setting.settingEl.addClass("local-gate-model-row");
+        row.settingEl.addClass("local-gate-model-row");
       });
     }
 
     const profileSection = containerEl.createDiv({ cls: "local-gate-section" });
     profileSection.createEl("h3", { text: "Saved Profiles" });
-
     this.plugin.settings.profiles.forEach((profile) => {
-      const setting = new Setting(profileSection)
+      const row = new Setting(profileSection)
         .setName(profile.name)
         .setDesc(
           `${providerLabel(profile.provider)} | ${profile.id} | capabilities: ${formatCapabilities(
@@ -467,56 +624,15 @@ class LocalGateSettingTab extends PluginSettingTab {
           button.setButtonText("Apply").onClick(async () => {
             await this.plugin.applyProfile(profile);
           })
-        );
-      setting.settingEl.addClass("local-gate-profile-row");
-    });
-
-    let profileJsonDraft = JSON.stringify(this.plugin.settings.profiles, null, 2);
-
-    const jsonSection = containerEl.createDiv({ cls: "local-gate-section" });
-    jsonSection.createEl("h3", { text: "Advanced Profile JSON" });
-
-    new Setting(jsonSection)
-      .setName("Profiles JSON")
-      .setDesc("Fields: id, name, provider, endpoint, capabilities, command, args, env, setAsDefaultAgent")
-      .addTextArea((textArea) => {
-        textArea.setValue(profileJsonDraft);
-        textArea.inputEl.rows = 16;
-        textArea.inputEl.cols = 80;
-        textArea.onChange((value) => {
-          profileJsonDraft = value;
-        });
-      });
-
-    new Setting(jsonSection)
-      .setName("Save profile JSON")
-      .setDesc("Validate and save")
-      .addButton((button) =>
-        button.setButtonText("Save").setCta().onClick(async () => {
-          try {
-            const parsed = JSON.parse(profileJsonDraft);
-            const normalizedProfiles = normalizeProfiles(parsed);
-            this.plugin.settings.profiles = normalizedProfiles;
-            if (!normalizedProfiles.find((profile) => profile.id === this.plugin.settings.lastProfileId)) {
-              this.plugin.settings.lastProfileId = normalizedProfiles[0].id;
-            }
-            await this.plugin.saveSettings();
-            new Notice("Local Gate: profiles saved.");
+        )
+        .addButton((button) =>
+          button.setButtonText("Delete").onClick(async () => {
+            await this.plugin.deleteProfile(profile.id);
             this.display();
-          } catch (error) {
-            new Notice(`Local Gate: invalid profile JSON (${error.message})`);
-          }
-        })
-      )
-      .addButton((button) =>
-        button.setButtonText("Reset defaults").onClick(async () => {
-          this.plugin.settings.profiles = clone(DEFAULT_PROFILES);
-          this.plugin.settings.lastProfileId = this.plugin.settings.profiles[0].id;
-          await this.plugin.saveSettings();
-          new Notice("Local Gate: default profiles restored.");
-          this.display();
-        })
-      );
+          })
+        );
+      row.settingEl.addClass("local-gate-profile-row");
+    });
 
     const integrationSection = containerEl.createDiv({ cls: "local-gate-section" });
     integrationSection.createEl("h3", { text: "Integration" });
@@ -526,15 +642,59 @@ class LocalGateSettingTab extends PluginSettingTab {
       .setDesc("Vault-relative path to Agent Client data.json")
       .addText((text) =>
         text
-          .setPlaceholder(DEFAULT_SETTINGS.agentClientSettingsPath)
+          .setPlaceholder(".obsidian/plugins/agent-client/data.json")
           .setValue(this.plugin.settings.agentClientSettingsPath)
           .onChange(async (value) => {
             this.plugin.settings.agentClientSettingsPath = sanitizeString(
               value,
-              DEFAULT_SETTINGS.agentClientSettingsPath
+              ".obsidian/plugins/agent-client/data.json"
             );
             await this.plugin.saveSettings();
           })
+      );
+
+    let profileJsonDraft = JSON.stringify(this.plugin.settings.profiles, null, 2);
+    const advancedSection = containerEl.createDiv({ cls: "local-gate-section" });
+    advancedSection.createEl("h3", { text: "Advanced Profile JSON" });
+    new Setting(advancedSection)
+      .setName("Profiles JSON")
+      .setDesc("Manual edit. Fields: id, name, provider, endpoint, capabilities, command, args, env, setAsDefaultAgent")
+      .addTextArea((textArea) => {
+        textArea.setValue(profileJsonDraft);
+        textArea.inputEl.rows = 14;
+        textArea.inputEl.cols = 80;
+        textArea.onChange((value) => {
+          profileJsonDraft = value;
+        });
+      });
+
+    new Setting(advancedSection)
+      .setName("Save / Reset")
+      .setDesc("Validate and persist profile JSON")
+      .addButton((button) =>
+        button.setButtonText("Save").setCta().onClick(async () => {
+          try {
+            const parsed = JSON.parse(profileJsonDraft);
+            this.plugin.settings.profiles = normalizeProfiles(parsed);
+            if (!this.plugin.settings.profiles.find((item) => item.id === this.plugin.settings.lastProfileId)) {
+              this.plugin.settings.lastProfileId = this.plugin.settings.profiles[0]?.id || "";
+            }
+            await this.plugin.saveSettings();
+            new Notice("Local Gate: profiles saved.");
+            this.display();
+          } catch (error) {
+            new Notice(`Local Gate: invalid JSON (${error.message}).`);
+          }
+        })
+      )
+      .addButton((button) =>
+        button.setButtonText("Reset defaults").onClick(async () => {
+          this.plugin.settings.profiles = defaultProfiles();
+          this.plugin.settings.lastProfileId = this.plugin.settings.profiles[0].id;
+          await this.plugin.saveSettings();
+          new Notice("Local Gate: defaults restored.");
+          this.display();
+        })
       );
   }
 }
@@ -565,45 +725,63 @@ class LocalGatePlugin extends Plugin {
       },
     });
 
+    this.addCommand({
+      id: "local-gate-sync-agent-client-models",
+      name: "Local Gate: Sync Models to Agent Client",
+      callback: async () => {
+        await this.syncProfilesToAgentClientAgents();
+      },
+    });
+
     this.addSettingTab(new LocalGateSettingTab(this.app, this));
 
     this.app.workspace.onLayoutReady(async () => {
-      if (this.settings.scanOnStartup && this.settings.discoveredModels.length === 0) {
+      if (this.settings.scanOnStartup) {
         await this.scanAndStoreModels({ silent: true });
       }
     });
   }
 
   async loadSettings() {
+    const defaults = defaultSettings();
     const loaded = (await this.loadData()) || {};
-    const normalizedProfiles = normalizeProfiles(loaded.profiles);
-    const normalizedDiscovered = normalizeDiscoveredModels(loaded.discoveredModels);
+    const profiles = normalizeProfiles(loaded.profiles);
+    const discovered = normalizeDiscoveredModels(loaded.discoveredModels);
 
     this.settings = {
-      agentClientSettingsPath: sanitizeString(
-        loaded.agentClientSettingsPath,
-        DEFAULT_SETTINGS.agentClientSettingsPath
-      ),
+      agentClientSettingsPath: sanitizeString(loaded.agentClientSettingsPath, defaults.agentClientSettingsPath),
       codexAcpCommand: sanitizeString(
         loaded.codexAcpCommand,
-        normalizedProfiles[0] ? normalizedProfiles[0].command : DEFAULT_SETTINGS.codexAcpCommand
+        sanitizeString(profiles[0]?.command, defaults.codexAcpCommand)
       ),
-      profiles: normalizedProfiles,
-      lastProfileId: sanitizeString(
-        loaded.lastProfileId,
-        normalizedProfiles[0] ? normalizedProfiles[0].id : DEFAULT_SETTINGS.lastProfileId
-      ),
-      discoveredModels: normalizedDiscovered,
-      scanOnStartup: typeof loaded.scanOnStartup === "boolean" ? loaded.scanOnStartup : DEFAULT_SETTINGS.scanOnStartup,
+      ollamaCommand: sanitizeString(loaded.ollamaCommand, defaults.ollamaCommand),
+      profiles,
+      lastProfileId: sanitizeString(loaded.lastProfileId, profiles[0]?.id || defaults.lastProfileId),
+      discoveredModels: discovered,
+      scanOnStartup: typeof loaded.scanOnStartup === "boolean" ? loaded.scanOnStartup : defaults.scanOnStartup,
       enableOllamaScan:
-        typeof loaded.enableOllamaScan === "boolean" ? loaded.enableOllamaScan : DEFAULT_SETTINGS.enableOllamaScan,
+        typeof loaded.enableOllamaScan === "boolean" ? loaded.enableOllamaScan : defaults.enableOllamaScan,
       enableLmStudioScan:
         typeof loaded.enableLmStudioScan === "boolean"
           ? loaded.enableLmStudioScan
-          : DEFAULT_SETTINGS.enableLmStudioScan,
-      ollamaBaseUrl: sanitizeString(loaded.ollamaBaseUrl, DEFAULT_SETTINGS.ollamaBaseUrl),
-      lmStudioBaseUrl: sanitizeString(loaded.lmStudioBaseUrl, DEFAULT_SETTINGS.lmStudioBaseUrl),
+          : defaults.enableLmStudioScan,
+      ollamaBaseUrl: normalizeOllamaBaseUrl(loaded.ollamaBaseUrl || defaults.ollamaBaseUrl),
+      lmStudioBaseUrl: normalizeLmStudioBaseUrl(loaded.lmStudioBaseUrl || defaults.lmStudioBaseUrl),
+      publishProfilesToAgentClient:
+        typeof loaded.publishProfilesToAgentClient === "boolean"
+          ? loaded.publishProfilesToAgentClient
+          : defaults.publishProfilesToAgentClient,
+      autoCreateProfilesFromDiscovery:
+        typeof loaded.autoCreateProfilesFromDiscovery === "boolean"
+          ? loaded.autoCreateProfilesFromDiscovery
+          : defaults.autoCreateProfilesFromDiscovery,
+      autoSyncToAgentClientAfterScan:
+        typeof loaded.autoSyncToAgentClientAfterScan === "boolean"
+          ? loaded.autoSyncToAgentClientAfterScan
+          : defaults.autoSyncToAgentClientAfterScan,
       lastScanAt: sanitizeString(loaded.lastScanAt, ""),
+      lastScanSummary: sanitizeString(loaded.lastScanSummary, ""),
+      lastScanErrors: sanitizeStringArray(loaded.lastScanErrors),
     };
   }
 
@@ -612,20 +790,21 @@ class LocalGatePlugin extends Plugin {
   }
 
   openProfileSwitcher() {
-    const profiles = this.settings.profiles;
-    if (profiles.length === 0) {
-      new Notice("Local Gate: no profiles configured.");
+    if (!Array.isArray(this.settings.profiles) || this.settings.profiles.length === 0) {
+      new Notice("Local Gate: no saved profile.");
       return;
     }
-
-    new ProfileSuggestModal(this.app, profiles, async (profile) => {
+    new ProfileSuggestModal(this.app, this.settings.profiles, async (profile) => {
       await this.applyProfile(profile);
     }).open();
   }
 
+  getProfileById(profileId) {
+    return this.settings.profiles.find((entry) => entry.id === profileId) || null;
+  }
+
   async applyLastProfile() {
-    const lastId = this.settings.lastProfileId;
-    const profile = this.settings.profiles.find((entry) => entry.id === lastId);
+    const profile = this.getProfileById(this.settings.lastProfileId);
     if (!profile) {
       new Notice("Local Gate: last profile not found.");
       return;
@@ -633,73 +812,139 @@ class LocalGatePlugin extends Plugin {
     await this.applyProfile(profile);
   }
 
-  getCodexCommandFallback() {
-    const configured = sanitizeString(this.settings.codexAcpCommand, "");
-    if (configured.length > 0) {
-      return configured;
+  async resolveCodexCommand(preferred) {
+    const command = sanitizeString(preferred, this.settings.codexAcpCommand || "codex-acp");
+    const resolved = await resolveExecutable(command, [
+      `${process.env.HOME || ""}/.local/bin/codex-acp`,
+      "/opt/homebrew/bin/codex-acp",
+      "/usr/local/bin/codex-acp",
+    ]);
+    return sanitizeString(resolved, command);
+  }
+
+  async applyProfile(profile) {
+    const normalized = sanitizeProfile(profile, 0);
+    const codexCommand = await this.resolveCodexCommand(normalized.command);
+    const path = normalizePath(this.settings.agentClientSettingsPath);
+    const data = await this.readOrCreateAgentClientSettings(path);
+
+    const existingCodex = data.codex || {};
+    data.codex = {
+      id: sanitizeString(existingCodex.id, "codex-acp"),
+      displayName: sanitizeString(existingCodex.displayName, "Codex"),
+      apiKey: sanitizeString(existingCodex.apiKey, ""),
+      command: codexCommand,
+      args: sanitizeStringArray(normalized.args),
+      env: sanitizeStringArray(normalized.env),
+    };
+
+    if (normalized.setAsDefaultAgent !== false) {
+      data.defaultAgentId = data.codex.id || "codex-acp";
     }
-    const fromProfile = this.settings.profiles.find((profile) => sanitizeString(profile.command, "").length > 0);
-    if (fromProfile) {
-      return fromProfile.command;
+
+    await this.app.vault.adapter.write(path, `${JSON.stringify(data, null, 2)}\n`);
+
+    this.settings.lastProfileId = normalized.id;
+    this.settings.codexAcpCommand = codexCommand;
+    await this.saveSettings();
+
+    if (!pathExists(codexCommand) && codexCommand === "codex-acp") {
+      new Notice("Local Gate: codex-acp path unresolved. Set absolute path in Codex ACP command.");
+    } else {
+      new Notice(`Local Gate: applied "${normalized.name}".`);
     }
-    return "codex-acp";
+
+    if (this.settings.publishProfilesToAgentClient) {
+      await this.syncProfilesToAgentClientAgents(true);
+    }
+  }
+
+  async deleteProfile(profileId) {
+    const originalCount = this.settings.profiles.length;
+    this.settings.profiles = this.settings.profiles.filter((profile) => profile.id !== profileId);
+    if (this.settings.profiles.length === originalCount) {
+      new Notice("Local Gate: profile not found.");
+      return;
+    }
+    if (this.settings.profiles.length === 0) {
+      this.settings.profiles = defaultProfiles();
+    }
+    if (!this.settings.profiles.find((profile) => profile.id === this.settings.lastProfileId)) {
+      this.settings.lastProfileId = this.settings.profiles[0].id;
+    }
+    await this.saveSettings();
+    new Notice("Local Gate: profile deleted.");
+    if (this.settings.publishProfilesToAgentClient) {
+      await this.syncProfilesToAgentClientAgents(true);
+    }
   }
 
   createProfileFromDiscovered(model) {
-    const endpoint = sanitizeString(
-      model.endpoint,
-      model.provider === "lmstudio" ? this.settings.lmStudioBaseUrl : this.settings.ollamaBaseUrl
-    );
-    const idBase = `${model.provider}-${slugify(model.model) || "model"}`;
+    const provider = sanitizeString(model.provider, "local");
+    const endpoint =
+      provider === "ollama"
+        ? toOpenAiEndpoint("ollama", this.settings.ollamaBaseUrl)
+        : provider === "lmstudio"
+        ? toOpenAiEndpoint("lmstudio", this.settings.lmStudioBaseUrl)
+        : sanitizeString(model.endpoint, "");
+    const modelName = sanitizeString(model.model, "unknown");
+    const idBase = `${provider}-${slugify(modelName) || "model"}`;
+
     return {
       id: idBase,
-      name: `${providerLabel(model.provider)}: ${model.model}`,
-      provider: model.provider,
+      name: `${providerLabel(provider)}: ${modelName}`,
+      provider,
       endpoint,
       capabilities: sanitizeStringArray(model.capabilities),
-      command: this.getCodexCommandFallback(),
-      args: buildLocalCodexArgs(model.model, endpoint),
+      command: this.settings.codexAcpCommand || "codex-acp",
+      args: buildLocalCodexArgs(modelName, endpoint),
       env: [],
       setAsDefaultAgent: true,
     };
   }
 
-  makeUniqueProfileId(baseId) {
-    const seen = new Set(this.settings.profiles.map((profile) => profile.id));
-    if (!seen.has(baseId)) {
+  getUniqueProfileId(baseId) {
+    const current = new Set(this.settings.profiles.map((profile) => profile.id));
+    if (!current.has(baseId)) {
       return baseId;
     }
-    let index = 2;
-    while (seen.has(`${baseId}-${index}`)) {
-      index += 1;
+    let suffix = 2;
+    while (current.has(`${baseId}-${suffix}`)) {
+      suffix += 1;
     }
-    return `${baseId}-${index}`;
+    return `${baseId}-${suffix}`;
+  }
+
+  upsertProfile(profile) {
+    const existingIndex = this.settings.profiles.findIndex(
+      (item) => item.provider === profile.provider && item.name === profile.name
+    );
+    if (existingIndex >= 0) {
+      this.settings.profiles[existingIndex] = sanitizeProfile(
+        {
+          ...this.settings.profiles[existingIndex],
+          ...profile,
+        },
+        existingIndex
+      );
+      return this.settings.profiles[existingIndex];
+    }
+
+    const normalized = sanitizeProfile(profile, this.settings.profiles.length);
+    normalized.id = this.getUniqueProfileId(normalized.id);
+    this.settings.profiles.push(normalized);
+    return normalized;
   }
 
   async addDiscoveredModelAsProfile(model) {
-    const template = this.createProfileFromDiscovered(model);
-    const existing = this.settings.profiles.find(
-      (profile) => profile.provider === model.provider && profile.name === template.name
-    );
-
-    if (existing) {
-      existing.endpoint = template.endpoint;
-      existing.capabilities = template.capabilities;
-      existing.command = template.command;
-      existing.args = template.args;
-      existing.env = template.env;
-      existing.setAsDefaultAgent = template.setAsDefaultAgent;
-      this.settings.lastProfileId = existing.id;
-      await this.saveSettings();
-      new Notice(`Local Gate: updated profile "${existing.name}".`);
-      return;
-    }
-
-    template.id = this.makeUniqueProfileId(template.id);
-    this.settings.profiles.push(template);
-    this.settings.lastProfileId = template.id;
+    const created = this.createProfileFromDiscovered(model);
+    const saved = this.upsertProfile(created);
+    this.settings.lastProfileId = saved.id;
     await this.saveSettings();
-    new Notice(`Local Gate: added profile "${template.name}".`);
+    new Notice(`Local Gate: profile saved (${saved.name}).`);
+    if (this.settings.publishProfilesToAgentClient) {
+      await this.syncProfilesToAgentClientAgents(true);
+    }
   }
 
   async applyDiscoveredModel(model) {
@@ -707,34 +952,239 @@ class LocalGatePlugin extends Plugin {
     await this.applyProfile(profile);
   }
 
-  async applyProfile(profile) {
-    const path = normalizePath(this.settings.agentClientSettingsPath);
-    const agentSettings = await this.readOrCreateAgentClientSettings(path);
-
-    const existingCodex = agentSettings.codex || {};
-    agentSettings.codex = {
-      id: sanitizeString(existingCodex.id, "codex-acp"),
-      displayName: sanitizeString(existingCodex.displayName, "Codex"),
-      apiKey: sanitizeString(existingCodex.apiKey, ""),
-      command: sanitizeString(profile.command, this.getCodexCommandFallback()),
-      args: sanitizeStringArray(profile.args),
-      env: sanitizeStringArray(profile.env),
-    };
-
-    if (profile.setAsDefaultAgent !== false) {
-      agentSettings.defaultAgentId = agentSettings.codex.id || "codex-acp";
+  async scanAndStoreModels(options = { silent: false }) {
+    const silent = options && options.silent === true;
+    if (!silent) {
+      new Notice("Local Gate: scanning...");
     }
 
-    await this.app.vault.adapter.write(path, `${JSON.stringify(agentSettings, null, 2)}\n`);
-    this.settings.lastProfileId = profile.id;
-    this.settings.codexAcpCommand = sanitizeString(profile.command, this.settings.codexAcpCommand);
+    const found = [];
+    const errors = [];
+
+    if (!this.settings.enableOllamaScan && !this.settings.enableLmStudioScan) {
+      this.settings.lastScanErrors = ["Both provider scans are disabled."];
+      this.settings.lastScanSummary = "No provider enabled.";
+      this.settings.lastScanAt = new Date().toLocaleString();
+      await this.saveSettings();
+      if (!silent) {
+        new Notice("Local Gate: enable at least one provider scan.");
+      }
+      return;
+    }
+
+    if (this.settings.enableOllamaScan) {
+      try {
+        const ollama = await this.scanOllamaModels();
+        found.push(...ollama);
+      } catch (error) {
+        errors.push(`Ollama: ${error.message}`);
+      }
+    }
+
+    if (this.settings.enableLmStudioScan) {
+      try {
+        const lm = await this.scanLmStudioModels();
+        found.push(...lm);
+      } catch (error) {
+        errors.push(`LM Studio: ${error.message}`);
+      }
+    }
+
+    this.settings.discoveredModels = normalizeDiscoveredModels(found);
+    this.settings.lastScanErrors = errors;
+    this.settings.lastScanAt = new Date().toLocaleString();
+    this.settings.lastScanSummary = `Discovered ${this.settings.discoveredModels.length} model(s).`;
+
+    if (this.settings.autoCreateProfilesFromDiscovery) {
+      this.settings.discoveredModels.forEach((model) => {
+        const profile = this.createProfileFromDiscovered(model);
+        this.upsertProfile(profile);
+      });
+    }
+
     await this.saveSettings();
-    new Notice(`Local Gate: applied "${profile.name}".`);
+
+    if (this.settings.publishProfilesToAgentClient && this.settings.autoSyncToAgentClientAfterScan) {
+      await this.syncProfilesToAgentClientAgents(true);
+    }
+
+    if (!silent) {
+      if (this.settings.discoveredModels.length > 0) {
+        new Notice(
+          `Local Gate: found ${this.settings.discoveredModels.length} model(s).` +
+            (errors.length > 0 ? ` Errors: ${errors.join(" | ")}` : "")
+        );
+      } else {
+        new Notice(`Local Gate: no model found.${errors.length > 0 ? ` ${errors.join(" | ")}` : ""}`);
+      }
+    }
+  }
+
+  async scanOllamaModels() {
+    const models = [];
+    const endpoint = toOpenAiEndpoint("ollama", this.settings.ollamaBaseUrl);
+    const apiBase = normalizeOllamaBaseUrl(this.settings.ollamaBaseUrl);
+
+    let cliWorked = false;
+    const resolvedOllama = await resolveExecutable(this.settings.ollamaCommand || "ollama", [
+      "/opt/homebrew/bin/ollama",
+      "/usr/local/bin/ollama",
+    ]);
+
+    try {
+      const listOutput = await runCommand(resolvedOllama, ["list"], 8000);
+      const lines = listOutput
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+
+      const entries = lines.slice(1).map((line) => line.split(/\s+/)[0]).filter(Boolean);
+      const names = [...new Set(entries)];
+
+      for (const name of names) {
+        let capabilities = [];
+        let contextLength = "";
+        try {
+          const showOutput = await runCommand(resolvedOllama, ["show", name], 6000);
+          const parsed = parseOllamaShow(showOutput);
+          capabilities = parsed.capabilities;
+          contextLength = parsed.contextLength;
+        } catch (_error) {
+        }
+
+        models.push({
+          key: `ollama:${name}`,
+          provider: "ollama",
+          model: name,
+          endpoint,
+          capabilities,
+          contextLength,
+        });
+      }
+      cliWorked = models.length > 0;
+    } catch (_error) {
+    }
+
+    if (cliWorked) {
+      return models;
+    }
+
+    const tagsResponse = await requestUrl({
+      url: `${apiBase}/api/tags`,
+      method: "GET",
+      throw: false,
+    });
+
+    if (tagsResponse.status >= 400) {
+      throw new Error(`Could not scan via CLI or HTTP (${tagsResponse.status})`);
+    }
+
+    const payload = tagsResponse.json;
+    const list = Array.isArray(payload && payload.models) ? payload.models : [];
+    const out = [];
+    for (const entry of list) {
+      const modelName = sanitizeString(entry && (entry.model || entry.name), "");
+      if (!modelName) {
+        continue;
+      }
+
+      let capabilities = [];
+      let contextLength = "";
+      try {
+        const showResponse = await requestUrl({
+          url: `${apiBase}/api/show`,
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: modelName }),
+          throw: false,
+        });
+        if (showResponse.status < 400) {
+          const showJson = showResponse.json || {};
+          if (Array.isArray(showJson.capabilities)) {
+            capabilities = sanitizeStringArray(showJson.capabilities);
+          }
+          if (showJson.details && showJson.details.context_length != null) {
+            contextLength = String(showJson.details.context_length);
+          }
+        }
+      } catch (_error) {
+      }
+
+      out.push({
+        key: `ollama:${modelName}`,
+        provider: "ollama",
+        model: modelName,
+        endpoint,
+        capabilities,
+        contextLength,
+      });
+    }
+
+    return out;
+  }
+
+  async scanLmStudioModels() {
+    const base = normalizeLmStudioBaseUrl(this.settings.lmStudioBaseUrl);
+    const attempts = [`${base}/models`, `${ensureNoTrailingSlash(base.replace(/\/v1$/, ""))}/v1/models`];
+    let lastError = "";
+
+    for (const url of attempts) {
+      try {
+        const response = await requestUrl({
+          url,
+          method: "GET",
+          throw: false,
+        });
+        if (response.status >= 400) {
+          lastError = `HTTP ${response.status} at ${url}`;
+          continue;
+        }
+        const payload = response.json;
+        const models = Array.isArray(payload && payload.data) ? payload.data : [];
+        return models
+          .map((entry) => sanitizeString(entry && entry.id, ""))
+          .filter(Boolean)
+          .map((modelId) => ({
+            key: `lmstudio:${modelId}`,
+            provider: "lmstudio",
+            model: modelId,
+            endpoint: base,
+            capabilities: ["completion"],
+            contextLength: "",
+          }));
+      } catch (error) {
+        lastError = error.message;
+      }
+    }
+
+    throw new Error(lastError || "LM Studio endpoint not reachable");
+  }
+
+  async syncProfilesToAgentClientAgents(silent = false) {
+    const path = normalizePath(this.settings.agentClientSettingsPath);
+    const data = await this.readOrCreateAgentClientSettings(path);
+    const customAgents = Array.isArray(data.customAgents) ? data.customAgents : [];
+    const kept = customAgents.filter((agent) => !String(agent && agent.id || "").startsWith("local-gate-"));
+
+    const codexCommand = await this.resolveCodexCommand(this.settings.codexAcpCommand || "codex-acp");
+    const generated = this.settings.profiles.map((profile) => ({
+      id: `local-gate-${slugify(profile.id) || slugify(profile.name)}`,
+      displayName: `[Local] ${profile.name}`,
+      command: codexCommand,
+      args: sanitizeStringArray(profile.args),
+      env: sanitizeStringArray(profile.env),
+    }));
+
+    data.customAgents = [...kept, ...generated];
+    await this.app.vault.adapter.write(path, `${JSON.stringify(data, null, 2)}\n`);
+
+    if (!silent) {
+      new Notice(`Local Gate: synced ${generated.length} model agent(s) to Agent Client.`);
+    }
   }
 
   async readOrCreateAgentClientSettings(path) {
     await this.ensureParentFolder(path);
-
     if (!(await this.app.vault.adapter.exists(path))) {
       return {
         codex: {
@@ -745,6 +1195,7 @@ class LocalGatePlugin extends Plugin {
           args: [],
           env: [],
         },
+        customAgents: [],
         defaultAgentId: "codex-acp",
       };
     }
@@ -753,10 +1204,12 @@ class LocalGatePlugin extends Plugin {
       const raw = await this.app.vault.adapter.read(path);
       const parsed = JSON.parse(raw);
       if (typeof parsed === "object" && parsed !== null) {
+        if (!Array.isArray(parsed.customAgents)) {
+          parsed.customAgents = [];
+        }
         return parsed;
       }
-    } catch (error) {
-      new Notice(`Local Gate: invalid Agent Client JSON, creating a safe replacement (${error.message}).`);
+    } catch (_error) {
     }
 
     return {
@@ -768,6 +1221,7 @@ class LocalGatePlugin extends Plugin {
         args: [],
         env: [],
       },
+      customAgents: [],
       defaultAgentId: "codex-acp",
     };
   }
@@ -777,128 +1231,13 @@ class LocalGatePlugin extends Plugin {
     if (parts.length < 2) {
       return;
     }
-    const folderPath = parts.slice(0, -1).join("/");
-    if (folderPath.length === 0) {
+    const folder = parts.slice(0, -1).join("/");
+    if (!folder) {
       return;
     }
-    if (!(await this.app.vault.adapter.exists(folderPath))) {
-      await this.app.vault.adapter.mkdir(folderPath);
+    if (!(await this.app.vault.adapter.exists(folder))) {
+      await this.app.vault.adapter.mkdir(folder);
     }
-  }
-
-  async scanAndStoreModels(options = { silent: false }) {
-    const silent = options.silent === true;
-    if (!silent) {
-      new Notice("Local Gate: scanning local models...");
-    }
-
-    const found = [];
-    const errors = [];
-
-    if (this.settings.enableOllamaScan) {
-      try {
-        const ollamaModels = await this.scanOllamaModels();
-        found.push(...ollamaModels);
-      } catch (error) {
-        errors.push(`Ollama: ${error.message}`);
-      }
-    }
-
-    if (this.settings.enableLmStudioScan) {
-      try {
-        const lmStudioModels = await this.scanLmStudioModels();
-        found.push(...lmStudioModels);
-      } catch (error) {
-        errors.push(`LM Studio: ${error.message}`);
-      }
-    }
-
-    this.settings.discoveredModels = normalizeDiscoveredModels(found);
-    this.settings.lastScanAt = new Date().toLocaleString();
-    await this.saveSettings();
-
-    if (!silent) {
-      if (this.settings.discoveredModels.length > 0) {
-        new Notice(
-          `Local Gate: found ${this.settings.discoveredModels.length} model(s).` +
-            (errors.length > 0 ? ` Partial errors: ${errors.join(" | ")}` : "")
-        );
-      } else {
-        new Notice(`Local Gate: no models found.${errors.length > 0 ? ` ${errors.join(" | ")}` : ""}`);
-      }
-    }
-  }
-
-  async scanOllamaModels() {
-    const listOutput = await runCommand("ollama", ["list"], 6000);
-    const lines = listOutput
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0);
-
-    if (lines.length <= 1) {
-      return [];
-    }
-
-    const modelNames = lines
-      .slice(1)
-      .map((line) => line.split(/\s+/)[0])
-      .filter((modelName) => modelName && modelName.toLowerCase() !== "name");
-
-    const uniqueModels = [...new Set(modelNames)];
-    const discovered = [];
-
-    for (const modelName of uniqueModels) {
-      let capabilities = [];
-      let contextLength = "";
-
-      try {
-        const showOutput = await runCommand("ollama", ["show", modelName], 6000);
-        const parsed = parseOllamaShow(showOutput);
-        capabilities = parsed.capabilities;
-        contextLength = parsed.contextLength;
-      } catch (_error) {
-        capabilities = [];
-      }
-
-      discovered.push({
-        key: `ollama:${modelName}`,
-        provider: "ollama",
-        model: modelName,
-        endpoint: this.settings.ollamaBaseUrl,
-        capabilities,
-        contextLength,
-      });
-    }
-
-    return discovered;
-  }
-
-  async scanLmStudioModels() {
-    const base = sanitizeString(this.settings.lmStudioBaseUrl, LMSTUDIO_DEFAULT_BASE_URL).replace(/\/+$/, "");
-    const response = await requestUrl({
-      url: `${base}/models`,
-      method: "GET",
-      throw: false,
-    });
-
-    if (response.status >= 400) {
-      throw new Error(`HTTP ${response.status} from ${base}/models`);
-    }
-
-    const payload = response.json;
-    const models = Array.isArray(payload && payload.data) ? payload.data : [];
-    return models
-      .map((entry) => sanitizeString(entry && entry.id, ""))
-      .filter((modelId) => modelId.length > 0)
-      .map((modelId) => ({
-        key: `lmstudio:${modelId}`,
-        provider: "lmstudio",
-        model: modelId,
-        endpoint: this.settings.lmStudioBaseUrl,
-        capabilities: ["completion"],
-        contextLength: "",
-      }));
   }
 }
 
