@@ -8,15 +8,21 @@ Local Gate is an Obsidian plugin that discovers local AI models (Ollama / LM Stu
   - Ollama via `ollama list` + `ollama show`
   - LM Studio via `GET /v1/models`
 - Capability display (for example: `completion`, `tools`, `thinking`)
+- Compatibility gate:
+  - Non-chat / non-tool models are shown as `blocked`
+  - Blocked models cannot be applied
+  - Blocked profiles are excluded from Agent Client sync
+- Provider-first Agent Client integration:
+  - Switch agent by provider (`Local Ollama`, `Local LM Studio`)
+  - Local Gate `Apply` updates Agent Client argument `model="<selected>"`
+  - Apply/Sync updates Agent Client runtime immediately (no Obsidian restart needed)
 - One-click actions from settings:
-  - `Add profile`
-  - `Apply now`
-- Saved profile controls:
   - `Apply`
-  - `Delete`
+  - `Hide`
+  - `Multi @mentions` (folders/files)
 - Agent Client integration:
-  - Sync profiles as `customAgents` entries
-  - Select each local model directly in Agent Client UI
+  - Sync provider agents as `customAgents` entries
+  - Keep model list in Agent Client model dropdown (via Codex remote models)
   - Keep built-in Claude/Codex/Gemini settings stable (Local Gate only manages local custom agents)
 - Profile switcher from command palette
 - Writes directly to Agent Client Codex config:
@@ -47,6 +53,8 @@ Local Gate is an Obsidian plugin that discovers local AI models (Ollama / LM Stu
 - `Local Gate: Apply Last Profile`
 - `Local Gate: Scan Local Models`
 - `Local Gate: Sync Models to Agent Client`
+- `Local Gate: Copy Folder @Mentions`
+- `Local Gate: Copy Multi @Mentions (Folders/Files)`
 
 ## Settings overview
 
@@ -55,43 +63,8 @@ Local Gate is an Obsidian plugin that discovers local AI models (Ollama / LM Stu
 - `Enable Ollama scan` / `Enable LM Studio scan`
 - `Ollama base URL` / `LM Studio base URL`
 - `Codex ACP command`
-- `Discovered Local Models`: add/apply directly
-- `Saved Profiles`: apply/delete quickly
+- `Discovered Local Models`: apply/hide directly
 - `Sync to Agent Client`: publish profile list to agent dropdown
-- `Advanced Profile JSON`: full manual editing
-
-## Default profiles
-
-- `Ollama: gpt-oss:20b`
-- `Ollama: qwen2.5-coder:14b`
-- `LM Studio: local-model`
-
-## Advanced profile format
-
-```json
-[
-  {
-    "id": "ollama-gpt-oss-20b",
-    "name": "Ollama: gpt-oss:20b",
-    "provider": "ollama",
-    "endpoint": "http://localhost:11434/v1",
-    "capabilities": ["completion", "tools", "thinking"],
-    "command": "codex-acp",
-    "args": [
-      "-c",
-      "model_provider=\"local\"",
-      "-c",
-      "model=\"gpt-oss:20b\"",
-      "-c",
-      "model_providers.local.name=\"local\"",
-      "-c",
-      "model_providers.local.base_url=\"http://localhost:11434/v1\""
-    ],
-    "env": [],
-    "setAsDefaultAgent": true
-  }
-]
-```
 
 ## Release checklist
 

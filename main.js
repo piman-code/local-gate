@@ -5,6 +5,7 @@ const {
   Plugin,
   PluginSettingTab,
   Setting,
+  Modal,
   SuggestModal,
   normalizePath,
   requestUrl,
@@ -104,6 +105,75 @@ function buildLocalCodexArgs(model, openAiBaseUrl) {
   ];
 }
 
+function unquoteValue(value) {
+  const text = sanitizeString(value, "");
+  if (text.length >= 2) {
+    const first = text[0];
+    const last = text[text.length - 1];
+    if ((first === "\"" && last === "\"") || (first === "'" && last === "'")) {
+      return text.slice(1, -1);
+    }
+  }
+  return text;
+}
+
+function parseModelFromArgs(args) {
+  const list = sanitizeStringArray(args);
+  for (let index = 0; index < list.length; index += 1) {
+    const token = list[index];
+    if (token === "-m" || token === "--model") {
+      return sanitizeString(list[index + 1], "");
+    }
+    if (token.startsWith("model=")) {
+      return unquoteValue(token.slice("model=".length));
+    }
+  }
+  return "";
+}
+
+function deriveModelName(rawProfile) {
+  const explicit = sanitizeString(rawProfile && rawProfile.model, "");
+  if (explicit.length > 0) {
+    return explicit;
+  }
+
+  const fromArgs = parseModelFromArgs(rawProfile && rawProfile.args);
+  if (fromArgs.length > 0) {
+    return fromArgs;
+  }
+
+  const name = sanitizeString(rawProfile && rawProfile.name, "");
+  const match = name.match(/:\s*(.+)$/);
+  if (match && match[1]) {
+    return sanitizeString(match[1], "");
+  }
+  return "";
+}
+
+function buildProviderCodexArgs(provider, endpoint, model) {
+  const normalizedProvider = sanitizeString(provider, "");
+  const normalizedEndpoint = sanitizeString(endpoint, "");
+  const providerName = normalizedProvider === "lmstudio" ? "LM Studio" : "Ollama";
+  const args = [
+    "-c",
+    "features.remote_models=true",
+    "-c",
+    `model_provider=${toTomlQuoted(normalizedProvider)}`,
+    "-c",
+    `model_provider_ids=[${toTomlQuoted(normalizedProvider)}]`,
+  ];
+  if (normalizedEndpoint.length > 0) {
+    args.push("-c", `model_providers.${normalizedProvider}.base_url=${toTomlQuoted(normalizedEndpoint)}`);
+  }
+  args.push("-c", `model_providers.${normalizedProvider}.name=${toTomlQuoted(providerName)}`);
+  args.push("-c", `model_providers.${normalizedProvider}.wire_api="responses"`);
+  const normalizedModel = sanitizeString(model, "");
+  if (normalizedModel.length > 0) {
+    args.push("-c", `model=${toTomlQuoted(normalizedModel)}`);
+  }
+  return args;
+}
+
 function providerLabel(provider) {
   if (provider === "ollama") {
     return "Ollama";
@@ -114,11 +184,83 @@ function providerLabel(provider) {
   return "Local";
 }
 
+function providerAgentDisplayName(provider) {
+  return `Local ${providerLabel(provider)}`;
+}
+
 function formatCapabilities(capabilities) {
   if (!Array.isArray(capabilities) || capabilities.length === 0) {
     return "unknown";
   }
   return capabilities.join(", ");
+}
+
+function capabilityBadges(modelName, capabilities) {
+  const caps = normalizeCapabilities(capabilities);
+  const model = sanitizeString(modelName, "").toLowerCase();
+  const badges = [];
+
+  if (caps.includes("completion")) {
+    badges.push("💬");
+  }
+  if (caps.includes("tools")) {
+    badges.push("🛠");
+  }
+  if (caps.includes("vision")) {
+    badges.push("👁");
+  }
+  if (caps.includes("thinking")) {
+    badges.push("🧠");
+  }
+  if (caps.includes("embedding")) {
+    badges.push("📎");
+  }
+  if (model.includes("coder") || model.includes("code")) {
+    badges.push("</>");
+  }
+
+  return badges.join(" ");
+}
+
+function formatCompatibilityStatus(item) {
+  if (item && item.compatible) {
+    return "ready";
+  }
+  return `blocked (${sanitizeString(item && item.compatibilityReason, "incompatible")})`;
+}
+
+function normalizeCapabilities(capabilities) {
+  return sanitizeStringArray(capabilities).map((item) => item.toLowerCase());
+}
+
+function evaluateModelCompatibility(provider, modelName, capabilities) {
+  const caps = normalizeCapabilities(capabilities);
+  const loweredName = String(modelName || "").toLowerCase();
+
+  if (caps.includes("embedding") && !caps.includes("completion")) {
+    return { compatible: false, reason: "embedding-only model (no chat)" };
+  }
+  if (provider === "ollama") {
+    if (!caps.includes("completion")) {
+      return { compatible: false, reason: "no completion capability" };
+    }
+    if (!caps.includes("tools")) {
+      return { compatible: false, reason: "no tools capability (required by codex-acp)" };
+    }
+    return { compatible: true, reason: "ok" };
+  }
+
+  if (provider === "lmstudio") {
+    if (loweredName.includes("embed")) {
+      return { compatible: false, reason: "embedding model likely no chat" };
+    }
+    return { compatible: true, reason: "assumed compatible (OpenAI endpoint)" };
+  }
+
+  if (caps.includes("completion")) {
+    return { compatible: true, reason: "completion available" };
+  }
+  return { compatible: false, reason: "unknown capabilities" };
 }
 
 function inferModelCapabilities(provider, modelName, currentCapabilities) {
@@ -217,8 +359,11 @@ function parseOllamaShow(showOutput) {
       continue;
     }
 
-    if (/^[A-Za-z][A-Za-z ]+$/.test(trimmed)) {
-      section = trimmed.toLowerCase();
+    const headingMatch = trimmed.match(
+      /^(model|capabilities|parameters|template|system|details|license)\s*:?\s*$/i
+    );
+    if (headingMatch) {
+      section = headingMatch[1].toLowerCase();
       continue;
     }
 
@@ -227,8 +372,8 @@ function parseOllamaShow(showOutput) {
       continue;
     }
 
-    if (section === "model" && /^context length\s+/i.test(trimmed)) {
-      const tail = trimmed.replace(/^context length\s+/i, "").trim();
+    if (section === "model" && /^context length\s*:?\s*/i.test(trimmed)) {
+      const tail = trimmed.replace(/^context length\s*:?\s*/i, "").trim();
       contextLength = tail;
     }
   }
@@ -242,6 +387,7 @@ function defaultProfiles() {
       id: "ollama-gpt-oss-20b",
       name: "Ollama: gpt-oss:20b",
       provider: "ollama",
+      model: "gpt-oss:20b",
       endpoint: toOpenAiEndpoint("ollama", OLLAMA_DEFAULT_BASE_URL),
       capabilities: ["completion", "tools", "thinking"],
       command: "codex-acp",
@@ -253,6 +399,7 @@ function defaultProfiles() {
       id: "ollama-qwen2-5-coder-14b",
       name: "Ollama: qwen2.5-coder:14b",
       provider: "ollama",
+      model: "qwen2.5-coder:14b",
       endpoint: toOpenAiEndpoint("ollama", OLLAMA_DEFAULT_BASE_URL),
       capabilities: ["completion", "tools"],
       command: "codex-acp",
@@ -271,6 +418,7 @@ function defaultSettings() {
     ollamaCommand: "ollama",
     profiles,
     lastProfileId: profiles[0].id,
+    activeProfileByProvider: {},
     discoveredModels: [],
     scanOnStartup: true,
     enableOllamaScan: true,
@@ -280,6 +428,8 @@ function defaultSettings() {
     publishProfilesToAgentClient: true,
     autoCreateProfilesFromDiscovery: true,
     autoSyncToAgentClientAfterScan: true,
+    showBlockedDiscoveredModels: false,
+    hiddenDiscoveredModelKeys: [],
     lastScanAt: "",
     lastScanSummary: "",
     lastScanErrors: [],
@@ -291,19 +441,24 @@ function sanitizeProfile(rawProfile, index) {
   const id = sanitizeString(rawProfile && rawProfile.id, fallbackId);
   const name = sanitizeString(rawProfile && rawProfile.name, id);
   const provider = sanitizeString(rawProfile && rawProfile.provider, "local");
+  const model = sanitizeString(rawProfile && rawProfile.model, deriveModelName(rawProfile));
   const endpoint = sanitizeString(rawProfile && rawProfile.endpoint, "");
   const capabilities = sanitizeStringArray(rawProfile && rawProfile.capabilities);
   const command = sanitizeString(rawProfile && rawProfile.command, "codex-acp");
   const args = sanitizeStringArray(rawProfile && rawProfile.args);
   const env = sanitizeStringArray(rawProfile && rawProfile.env);
   const setAsDefaultAgent = rawProfile && rawProfile.setAsDefaultAgent !== false;
+  const compat = evaluateModelCompatibility(provider, model || name, capabilities);
 
   return {
     id,
     name,
     provider,
+    model,
     endpoint,
     capabilities,
+    compatible: compat.compatible,
+    compatibilityReason: compat.reason,
     command,
     args,
     env,
@@ -331,12 +486,18 @@ function normalizeProfiles(rawProfiles) {
 
 function sanitizeDiscoveredModel(rawModel, index) {
   const fallbackKey = `model-${index + 1}`;
+  const provider = sanitizeString(rawModel && rawModel.provider, "local");
+  const model = sanitizeString(rawModel && rawModel.model, "unknown");
+  const capabilities = sanitizeStringArray(rawModel && rawModel.capabilities);
+  const compat = evaluateModelCompatibility(provider, model, capabilities);
   return {
     key: sanitizeString(rawModel && rawModel.key, fallbackKey),
-    provider: sanitizeString(rawModel && rawModel.provider, "local"),
-    model: sanitizeString(rawModel && rawModel.model, "unknown"),
+    provider,
+    model,
     endpoint: sanitizeString(rawModel && rawModel.endpoint, ""),
-    capabilities: sanitizeStringArray(rawModel && rawModel.capabilities),
+    capabilities,
+    compatible: compat.compatible,
+    compatibilityReason: compat.reason,
     contextLength: sanitizeString(rawModel && rawModel.contextLength, ""),
   };
 }
@@ -384,15 +545,206 @@ class ProfileSuggestModal extends SuggestModal {
     const row = el.createDiv({ cls: "local-gate-suggest-row" });
     row.createEl("div", { text: profile.name, cls: "local-gate-suggest-title" });
     row.createEl("small", {
-      text: `${providerLabel(profile.provider)} | ${profile.id} | capabilities: ${formatCapabilities(
-        profile.capabilities
-      )}`,
+      text: `${providerLabel(profile.provider)} | model: ${sanitizeString(profile.model, "(auto)")} | ${profile.id} | capabilities: ${formatCapabilities(profile.capabilities)} | status: ${formatCompatibilityStatus(profile)}`,
       cls: "local-gate-suggest-meta",
     });
   }
 
   onChooseSuggestion(profile) {
     this.onChoose(profile);
+  }
+}
+
+class LocalGateFolderSuggestModal extends SuggestModal {
+  constructor(app, folders, onChoose) {
+    super(app);
+    this.folders = folders;
+    this.onChoose = onChoose;
+    this.setPlaceholder("Select folder for @mentions...");
+  }
+
+  getSuggestions(query) {
+    const lowered = query.toLowerCase();
+    return this.folders.filter((folder) => (lowered.length === 0 ? true : folder.toLowerCase().includes(lowered)));
+  }
+
+  renderSuggestion(folder, el) {
+    el.createEl("div", { text: folder || "/" });
+  }
+
+  onChooseSuggestion(folder) {
+    this.onChoose(folder);
+  }
+}
+
+class LocalGateMultiMentionModal extends Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+    this.activeTab = "folders";
+    this.query = "";
+    this.selectedFolders = new Set();
+    this.selectedFiles = new Set();
+    this.folders = plugin.getFolderListFromVault();
+    this.files = plugin.getMarkdownFilePaths();
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("local-gate-mention-modal");
+
+    contentEl.createEl("h3", { text: "Multi @mentions" });
+
+    const tabRow = contentEl.createDiv({ cls: "local-gate-mention-tabs" });
+    this.folderTabButton = tabRow.createEl("button", { text: "Folders" });
+    this.fileTabButton = tabRow.createEl("button", { text: "Files" });
+    this.folderTabButton.onclick = () => {
+      this.activeTab = "folders";
+      this.render();
+    };
+    this.fileTabButton.onclick = () => {
+      this.activeTab = "files";
+      this.render();
+    };
+
+    const searchWrap = contentEl.createDiv({ cls: "local-gate-mention-search-wrap" });
+    this.searchInput = searchWrap.createEl("input", {
+      type: "text",
+      placeholder: "Search folders/files...",
+      cls: "local-gate-mention-search",
+    });
+    this.searchInput.oninput = () => {
+      this.query = sanitizeString(this.searchInput.value, "").toLowerCase();
+      this.renderList();
+    };
+
+    this.summaryEl = contentEl.createDiv({ cls: "local-gate-mention-summary" });
+    this.listEl = contentEl.createDiv({ cls: "local-gate-mention-list" });
+
+    const actionRow = contentEl.createDiv({ cls: "local-gate-mention-actions" });
+    const clearButton = actionRow.createEl("button", { text: "Clear" });
+    clearButton.onclick = () => {
+      this.selectedFolders.clear();
+      this.selectedFiles.clear();
+      this.render();
+    };
+
+    const copyButton = actionRow.createEl("button", { text: "Copy @mentions", cls: "mod-cta" });
+    copyButton.onclick = async () => {
+      await this.copyMentions();
+    };
+
+    this.render();
+    window.setTimeout(() => this.searchInput && this.searchInput.focus(), 0);
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+
+  getFilteredItems() {
+    const source = this.activeTab === "folders" ? this.folders : this.files;
+    if (!this.query) {
+      return source;
+    }
+    return source.filter((item) => item.toLowerCase().includes(this.query));
+  }
+
+  toggleSelection(item) {
+    if (this.activeTab === "folders") {
+      if (this.selectedFolders.has(item)) {
+        this.selectedFolders.delete(item);
+      } else {
+        this.selectedFolders.add(item);
+      }
+      return;
+    }
+
+    if (this.selectedFiles.has(item)) {
+      this.selectedFiles.delete(item);
+    } else {
+      this.selectedFiles.add(item);
+    }
+  }
+
+  render() {
+    this.folderTabButton.classList.toggle("local-gate-tab-active", this.activeTab === "folders");
+    this.fileTabButton.classList.toggle("local-gate-tab-active", this.activeTab === "files");
+    this.renderSummary();
+    this.renderList();
+  }
+
+  renderSummary() {
+    this.summaryEl.empty();
+    this.summaryEl.setText(
+      `Selected folders: ${this.selectedFolders.size} | files: ${this.selectedFiles.size} | ` +
+        `tab: ${this.activeTab === "folders" ? "Folders" : "Files"}`
+    );
+  }
+
+  renderList() {
+    this.listEl.empty();
+    const items = this.getFilteredItems();
+    const maxRows = 200;
+    const visible = items.slice(0, maxRows);
+
+    if (visible.length === 0) {
+      this.listEl.createEl("div", { text: "No matches.", cls: "local-gate-mention-empty" });
+      return;
+    }
+
+    visible.forEach((item) => {
+      const selected = this.activeTab === "folders" ? this.selectedFolders.has(item) : this.selectedFiles.has(item);
+      const row = this.listEl.createDiv({ cls: "local-gate-mention-row" });
+      row.addClass(selected ? "local-gate-mention-row-selected" : "local-gate-mention-row-normal");
+
+      const check = row.createEl("input", { type: "checkbox" });
+      check.checked = selected;
+      check.onclick = (event) => {
+        event.stopPropagation();
+        this.toggleSelection(item);
+        this.render();
+      };
+
+      const label = row.createEl("div", { cls: "local-gate-mention-row-label" });
+      label.setText(item);
+
+      row.onclick = () => {
+        this.toggleSelection(item);
+        this.render();
+      };
+    });
+
+    if (items.length > maxRows) {
+      this.listEl.createEl("div", {
+        text: `Showing first ${maxRows} of ${items.length}. Refine search for more.`,
+        cls: "local-gate-mention-hint",
+      });
+    }
+  }
+
+  async copyMentions() {
+    const folders = Array.from(this.selectedFolders);
+    const files = Array.from(this.selectedFiles);
+    const built = this.plugin.buildMentionsFromSelections(folders, files);
+
+    if (!built.mentions) {
+      new Notice("Local Gate: no notes selected.");
+      return;
+    }
+
+    try {
+      const inserted = await this.plugin.copyMentionsAndTryInsertToChat(built.mentions);
+      new Notice(
+        `Local Gate: copied ${built.count} @mentions` +
+          (inserted ? " and inserted into active chat." : ". Auto-insert unavailable, paste manually.") +
+          (built.truncated ? ` (limited to ${built.count}/${built.total})` : "")
+      );
+      this.close();
+    } catch (error) {
+      new Notice(`Local Gate: failed to copy mentions (${error.message}).`);
+    }
   }
 }
 
@@ -417,29 +769,29 @@ class LocalGateSettingTab extends PluginSettingTab {
     quickSection.createEl("h3", { text: "Quick Actions" });
 
     new Setting(quickSection)
-      .setName("Profile switcher")
-      .setDesc("Open interactive profile picker")
-      .addButton((button) =>
-        button.setButtonText("Open").setCta().onClick(() => {
-          this.plugin.openProfileSwitcher();
-        })
-      );
-
-    new Setting(quickSection)
-      .setName("Apply last profile")
-      .setDesc(`Current: ${this.plugin.settings.lastProfileId || "(none)"}`)
-      .addButton((button) =>
-        button.setButtonText("Apply").onClick(async () => {
-          await this.plugin.applyLastProfile();
-        })
-      );
-
-    new Setting(quickSection)
       .setName("Sync to Agent Client")
-      .setDesc("Publish saved profiles as Agent Client custom agents")
+      .setDesc("Publish local provider agents (Ollama / LM Studio) to Agent Client")
       .addButton((button) =>
         button.setButtonText("Sync").setCta().onClick(async () => {
           await this.plugin.syncProfilesToAgentClientAgents();
+        })
+      );
+
+    new Setting(quickSection)
+      .setName("Folder @mentions")
+      .setDesc("Copy many note references from one folder (RAG-style context)")
+      .addButton((button) =>
+        button.setButtonText("Copy").onClick(async () => {
+          await this.plugin.copyFolderMentionsToClipboard();
+        })
+      );
+
+    new Setting(quickSection)
+      .setName("Multi @mentions")
+      .setDesc("Select many folders/files and copy merged note references")
+      .addButton((button) =>
+        button.setButtonText("Open").onClick(async () => {
+          await this.plugin.copyMultiMentionsToClipboard();
         })
       );
 
@@ -558,7 +910,7 @@ class LocalGateSettingTab extends PluginSettingTab {
 
     new Setting(scanSection)
       .setName("Auto-create profiles from discovered models")
-      .setDesc("Save newly discovered models into Saved Profiles")
+      .setDesc("Keep discovered model state for apply/sync")
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.autoCreateProfilesFromDiscovery).onChange(async (value) => {
           this.plugin.settings.autoCreateProfilesFromDiscovery = value;
@@ -568,7 +920,7 @@ class LocalGateSettingTab extends PluginSettingTab {
 
     new Setting(scanSection)
       .setName("Publish profiles to Agent Client")
-      .setDesc("Show local models in Agent Client agent dropdown")
+      .setDesc("Show local providers in agent dropdown and select models from chat model picker")
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.publishProfilesToAgentClient).onChange(async (value) => {
           this.plugin.settings.publishProfilesToAgentClient = value;
@@ -586,57 +938,85 @@ class LocalGateSettingTab extends PluginSettingTab {
         })
       );
 
+    new Setting(scanSection)
+      .setName("Show blocked discovered models")
+      .setDesc("Show non-applicable models in list (disabled/gray)")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.showBlockedDiscoveredModels).onChange(async (value) => {
+          this.plugin.settings.showBlockedDiscoveredModels = value;
+          await this.plugin.saveSettings();
+          this.display();
+        })
+      );
+
     const discoveredSection = containerEl.createDiv({ cls: "local-gate-section" });
     discoveredSection.createEl("h3", { text: "Discovered Local Models" });
-    if (this.plugin.settings.discoveredModels.length === 0) {
-      discoveredSection.createEl("p", { text: "No models discovered yet.", cls: "local-gate-empty" });
-    } else {
-      this.plugin.settings.discoveredModels.forEach((model) => {
-        const row = new Setting(discoveredSection)
-          .setName(`${providerLabel(model.provider)}: ${model.model}`)
-          .setDesc(
-            `${model.endpoint} | capabilities: ${formatCapabilities(model.capabilities)}${
-              model.contextLength ? ` | context: ${model.contextLength}` : ""
-            }`
-          )
-          .addButton((button) =>
-            button.setButtonText("Add profile").onClick(async () => {
-              await this.plugin.addDiscoveredModelAsProfile(model);
-              this.display();
-            })
-          )
-          .addButton((button) =>
-            button.setButtonText("Apply").setCta().onClick(async () => {
-              await this.plugin.applyDiscoveredModel(model);
-            })
-          );
-        row.settingEl.addClass("local-gate-model-row");
+    const hiddenKeys = new Set(this.plugin.settings.hiddenDiscoveredModelKeys);
+    const visibleModels = this.plugin.settings.discoveredModels.filter((model) => {
+      if (hiddenKeys.has(model.key)) {
+        return false;
+      }
+      if (!this.plugin.settings.showBlockedDiscoveredModels && !model.compatible) {
+        return false;
+      }
+      return true;
+    });
+    const hiddenBlockedCount = this.plugin.settings.discoveredModels.filter(
+      (model) => !model.compatible && !this.plugin.settings.showBlockedDiscoveredModels
+    ).length;
+    const hiddenManualCount = this.plugin.settings.hiddenDiscoveredModelKeys.length;
+    if (hiddenBlockedCount > 0 || hiddenManualCount > 0) {
+      discoveredSection.createEl("p", {
+        text: `Hidden: blocked ${hiddenBlockedCount}, manual ${hiddenManualCount}`,
+        cls: "local-gate-meta",
       });
     }
 
-    const profileSection = containerEl.createDiv({ cls: "local-gate-section" });
-    profileSection.createEl("h3", { text: "Saved Profiles" });
-    this.plugin.settings.profiles.forEach((profile) => {
-      const row = new Setting(profileSection)
-        .setName(profile.name)
-        .setDesc(
-          `${providerLabel(profile.provider)} | ${profile.id} | capabilities: ${formatCapabilities(
-            profile.capabilities
-          )}`
-        )
+    if (visibleModels.length === 0) {
+      discoveredSection.createEl("p", { text: "No models discovered yet.", cls: "local-gate-empty" });
+    } else {
+      visibleModels.forEach((model) => {
+        const row = new Setting(discoveredSection)
+          .setName(`${providerLabel(model.provider)}: ${model.model}${model.compatible ? "" : " (blocked)"}`)
+          .setDesc(
+            `${capabilityBadges(model.model, model.capabilities)} | ${model.endpoint} | capabilities: ${formatCapabilities(model.capabilities)}${
+              model.contextLength ? ` | context: ${model.contextLength}` : ""
+            } | status: ${formatCompatibilityStatus(model)}`
+          )
+          .addButton((button) =>
+            button
+              .setButtonText("Apply")
+              .setCta()
+              .setDisabled(!model.compatible)
+              .onClick(async () => {
+                await this.plugin.applyDiscoveredModel(model);
+                this.display();
+              })
+          )
+          .addButton((button) =>
+            button.setButtonText("Hide").onClick(async () => {
+              await this.plugin.hideDiscoveredModel(model.key);
+              this.display();
+            })
+          );
+        row.settingEl.addClass("local-gate-model-row");
+        if (!model.compatible) {
+          row.settingEl.addClass("local-gate-row-unsupported");
+        }
+      });
+    }
+
+    if (hiddenManualCount > 0) {
+      new Setting(discoveredSection)
+        .setName("Reset hidden models")
+        .setDesc("Unhide all manually hidden discovered models")
         .addButton((button) =>
-          button.setButtonText("Apply").onClick(async () => {
-            await this.plugin.applyProfile(profile);
-          })
-        )
-        .addButton((button) =>
-          button.setButtonText("Delete").onClick(async () => {
-            await this.plugin.deleteProfile(profile.id);
+          button.setButtonText("Reset").onClick(async () => {
+            await this.plugin.unhideAllDiscoveredModels();
             this.display();
           })
         );
-      row.settingEl.addClass("local-gate-profile-row");
-    });
+    }
 
     const integrationSection = containerEl.createDiv({ cls: "local-gate-section" });
     integrationSection.createEl("h3", { text: "Integration" });
@@ -657,49 +1037,6 @@ class LocalGateSettingTab extends PluginSettingTab {
           })
       );
 
-    let profileJsonDraft = JSON.stringify(this.plugin.settings.profiles, null, 2);
-    const advancedSection = containerEl.createDiv({ cls: "local-gate-section" });
-    advancedSection.createEl("h3", { text: "Advanced Profile JSON" });
-    new Setting(advancedSection)
-      .setName("Profiles JSON")
-      .setDesc("Manual edit. Fields: id, name, provider, endpoint, capabilities, command, args, env, setAsDefaultAgent")
-      .addTextArea((textArea) => {
-        textArea.setValue(profileJsonDraft);
-        textArea.inputEl.rows = 14;
-        textArea.inputEl.cols = 80;
-        textArea.onChange((value) => {
-          profileJsonDraft = value;
-        });
-      });
-
-    new Setting(advancedSection)
-      .setName("Save / Reset")
-      .setDesc("Validate and persist profile JSON")
-      .addButton((button) =>
-        button.setButtonText("Save").setCta().onClick(async () => {
-          try {
-            const parsed = JSON.parse(profileJsonDraft);
-            this.plugin.settings.profiles = normalizeProfiles(parsed);
-            if (!this.plugin.settings.profiles.find((item) => item.id === this.plugin.settings.lastProfileId)) {
-              this.plugin.settings.lastProfileId = this.plugin.settings.profiles[0]?.id || "";
-            }
-            await this.plugin.saveSettings();
-            new Notice("Local Gate: profiles saved.");
-            this.display();
-          } catch (error) {
-            new Notice(`Local Gate: invalid JSON (${error.message}).`);
-          }
-        })
-      )
-      .addButton((button) =>
-        button.setButtonText("Reset defaults").onClick(async () => {
-          this.plugin.settings.profiles = defaultProfiles();
-          this.plugin.settings.lastProfileId = this.plugin.settings.profiles[0].id;
-          await this.plugin.saveSettings();
-          new Notice("Local Gate: defaults restored.");
-          this.display();
-        })
-      );
   }
 }
 
@@ -738,6 +1075,22 @@ class LocalGatePlugin extends Plugin {
       },
     });
 
+    this.addCommand({
+      id: "local-gate-copy-folder-mentions",
+      name: "Local Gate: Copy Folder @Mentions",
+      callback: async () => {
+        await this.copyFolderMentionsToClipboard();
+      },
+    });
+
+    this.addCommand({
+      id: "local-gate-copy-multi-mentions",
+      name: "Local Gate: Copy Multi @Mentions (Folders/Files)",
+      callback: async () => {
+        await this.copyMultiMentionsToClipboard();
+      },
+    });
+
     this.addSettingTab(new LocalGateSettingTab(this.app, this));
 
     this.app.workspace.onLayoutReady(async () => {
@@ -765,6 +1118,7 @@ class LocalGatePlugin extends Plugin {
       ollamaCommand: sanitizeString(loaded.ollamaCommand, defaults.ollamaCommand),
       profiles,
       lastProfileId: sanitizeString(loaded.lastProfileId, profiles[0]?.id || defaults.lastProfileId),
+      activeProfileByProvider: {},
       discoveredModels: discovered,
       scanOnStartup: typeof loaded.scanOnStartup === "boolean" ? loaded.scanOnStartup : defaults.scanOnStartup,
       enableOllamaScan:
@@ -787,13 +1141,28 @@ class LocalGatePlugin extends Plugin {
         typeof loaded.autoSyncToAgentClientAfterScan === "boolean"
           ? loaded.autoSyncToAgentClientAfterScan
           : defaults.autoSyncToAgentClientAfterScan,
+      showBlockedDiscoveredModels:
+        typeof loaded.showBlockedDiscoveredModels === "boolean"
+          ? loaded.showBlockedDiscoveredModels
+          : defaults.showBlockedDiscoveredModels,
+      hiddenDiscoveredModelKeys: sanitizeStringArray(loaded.hiddenDiscoveredModelKeys),
       lastScanAt: sanitizeString(loaded.lastScanAt, ""),
       lastScanSummary: sanitizeString(loaded.lastScanSummary, ""),
       lastScanErrors: sanitizeStringArray(loaded.lastScanErrors),
     };
 
+    if (loaded.activeProfileByProvider && typeof loaded.activeProfileByProvider === "object") {
+      Object.entries(loaded.activeProfileByProvider).forEach(([provider, profileId]) => {
+        const safeProvider = sanitizeString(provider, "");
+        const safeProfileId = sanitizeString(profileId, "");
+        if (safeProvider.length > 0 && safeProfileId.length > 0) {
+          this.settings.activeProfileByProvider[safeProvider] = safeProfileId;
+        }
+      });
+    }
+
     this.settings.profiles = this.settings.profiles
-      .map((profile) => {
+      .map((profile, index) => {
         const migrated = { ...profile };
         if (migrated.provider === "local") {
           if (String(migrated.name || "").toLowerCase().includes("lm studio")) {
@@ -814,7 +1183,7 @@ class LocalGatePlugin extends Plugin {
           migrated.name,
           sanitizeStringArray(migrated.capabilities)
         );
-        return sanitizeProfile(migrated, 0);
+        return sanitizeProfile(migrated, index);
       })
       .filter((profile) => !(profile.id === "lmstudio-default" || profile.id === "lmstudio-local-model"));
 
@@ -824,10 +1193,198 @@ class LocalGatePlugin extends Plugin {
     if (!this.settings.profiles.find((profile) => profile.id === this.settings.lastProfileId)) {
       this.settings.lastProfileId = this.settings.profiles[0].id;
     }
+
+    Object.entries(this.settings.activeProfileByProvider).forEach(([provider, profileId]) => {
+      const exists = this.settings.profiles.some((profile) => profile.provider === provider && profile.id === profileId);
+      if (!exists) {
+        delete this.settings.activeProfileByProvider[provider];
+      }
+    });
+
+    const discoveredKeys = new Set(this.settings.discoveredModels.map((model) => model.key));
+    this.settings.hiddenDiscoveredModelKeys = this.settings.hiddenDiscoveredModelKeys.filter((key) => discoveredKeys.has(key));
   }
 
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+
+  isDiscoveredModelHidden(modelKey) {
+    return this.settings.hiddenDiscoveredModelKeys.includes(modelKey);
+  }
+
+  async hideDiscoveredModel(modelKey) {
+    if (!this.settings.hiddenDiscoveredModelKeys.includes(modelKey)) {
+      this.settings.hiddenDiscoveredModelKeys.push(modelKey);
+      await this.saveSettings();
+    }
+  }
+
+  async unhideAllDiscoveredModels() {
+    this.settings.hiddenDiscoveredModelKeys = [];
+    await this.saveSettings();
+  }
+
+  getFolderListFromVault() {
+    const files = this.app.vault.getMarkdownFiles();
+    const folders = new Set();
+    files.forEach((file) => {
+      const parentPath = sanitizeString((file.parent && file.parent.path) || "", "");
+      if (parentPath.length > 0) {
+        folders.add(parentPath);
+      }
+    });
+    return Array.from(folders).sort((a, b) => a.localeCompare(b));
+  }
+
+  getMarkdownFilePaths() {
+    return this.app.vault
+      .getMarkdownFiles()
+      .map((file) => sanitizeString(file.path, "").replace(/\\/g, "/"))
+      .filter(Boolean)
+      .sort((a, b) => a.localeCompare(b));
+  }
+
+  normalizeMentionPath(filePath) {
+    return sanitizeString(filePath, "")
+      .replace(/\\/g, "/")
+      .replace(/^\/+/, "")
+      .replace(/\.md$/i, "");
+  }
+
+  collectMentionFilePaths(folderPaths = [], filePaths = []) {
+    const allFiles = this.getMarkdownFilePaths();
+    const selected = new Set();
+    const normalizedFolders = sanitizeStringArray(folderPaths)
+      .map((folder) => folder.replace(/\\/g, "/").replace(/\/+$/, ""))
+      .filter(Boolean);
+
+    normalizedFolders.forEach((folder) => {
+      const prefix = `${folder}/`;
+      allFiles.forEach((filePath) => {
+        if (filePath.startsWith(prefix)) {
+          selected.add(filePath);
+        }
+      });
+    });
+
+    sanitizeStringArray(filePaths)
+      .map((filePath) => filePath.replace(/\\/g, "/").replace(/^\/+/, ""))
+      .forEach((filePath) => {
+        if (allFiles.includes(filePath)) {
+          selected.add(filePath);
+        }
+      });
+
+    return Array.from(selected).sort((a, b) => a.localeCompare(b));
+  }
+
+  buildMentionsFromSelections(folderPaths = [], filePaths = []) {
+    const files = this.collectMentionFilePaths(folderPaths, filePaths);
+    const limit = 80;
+    const selected = files.slice(0, limit);
+    const mentions = selected.map((filePath) => `@${this.normalizeMentionPath(filePath)}`).join(" ");
+    return {
+      mentions,
+      count: selected.length,
+      truncated: files.length > selected.length,
+      total: files.length,
+    };
+  }
+
+  buildMentionsFromFolder(folderPath) {
+    return this.buildMentionsFromSelections([folderPath], []);
+  }
+
+  getAgentClientPlugin() {
+    return this.app && this.app.plugins && this.app.plugins.plugins
+      ? this.app.plugins.plugins["agent-client"] || null
+      : null;
+  }
+
+  getActiveAgentClientChatView() {
+    const agentClient = this.getAgentClientPlugin();
+    if (!agentClient || typeof agentClient.getAllChatViews !== "function") {
+      return null;
+    }
+    const views = agentClient.getAllChatViews();
+    if (!Array.isArray(views) || views.length === 0) {
+      return null;
+    }
+
+    const activeId = sanitizeString(String(agentClient.lastActiveChatViewId || ""), "");
+    if (activeId.length > 0) {
+      const active = views.find((view) => sanitizeString(String(view && view.viewId || ""), "") === activeId);
+      if (active) {
+        return active;
+      }
+    }
+
+    return views[0];
+  }
+
+  tryInsertMentionsToActiveChat(mentions) {
+    const text = sanitizeString(mentions, "");
+    if (text.length === 0) {
+      return false;
+    }
+
+    const view = this.getActiveAgentClientChatView();
+    if (!view || typeof view.getInputState !== "function" || typeof view.setInputState !== "function") {
+      return false;
+    }
+
+    const current = view.getInputState() || {};
+    const currentText = sanitizeString(current.text, "");
+    const currentImages = Array.isArray(current.images) ? current.images : [];
+    const nextText = currentText.length > 0 ? `${currentText}\n${text}` : text;
+    view.setInputState({ text: nextText, images: currentImages });
+    return true;
+  }
+
+  async copyMentionsAndTryInsertToChat(mentions) {
+    await navigator.clipboard.writeText(mentions);
+    try {
+      return this.tryInsertMentionsToActiveChat(mentions);
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  async copyFolderMentionsToClipboard() {
+    const folders = this.getFolderListFromVault();
+    if (folders.length === 0) {
+      new Notice("Local Gate: no folders with markdown files found.");
+      return;
+    }
+
+    new LocalGateFolderSuggestModal(this.app, folders, async (folder) => {
+      const built = this.buildMentionsFromFolder(folder);
+      if (!built.mentions) {
+        new Notice("Local Gate: no markdown notes found in selected folder.");
+        return;
+      }
+      try {
+        const inserted = await this.copyMentionsAndTryInsertToChat(built.mentions);
+        new Notice(
+          `Local Gate: copied ${built.count} @mentions from "${folder}"` +
+            (inserted ? " and inserted into active chat." : ". Auto-insert unavailable, paste manually.") +
+            (built.truncated ? ` (limited to ${built.count}/${built.total})` : "")
+        );
+      } catch (error) {
+        new Notice(`Local Gate: failed to copy mentions (${error.message}).`);
+      }
+    }).open();
+  }
+
+  async copyMultiMentionsToClipboard() {
+    const folders = this.getFolderListFromVault();
+    const files = this.getMarkdownFilePaths();
+    if (folders.length === 0 && files.length === 0) {
+      new Notice("Local Gate: no markdown files found.");
+      return;
+    }
+    new LocalGateMultiMentionModal(this.app, this).open();
   }
 
   openProfileSwitcher() {
@@ -835,7 +1392,14 @@ class LocalGatePlugin extends Plugin {
       new Notice("Local Gate: no saved profile.");
       return;
     }
-    new ProfileSuggestModal(this.app, this.settings.profiles, async (profile) => {
+    const compatibleProfiles = this.settings.profiles
+      .map((profile, index) => sanitizeProfile(profile, index))
+      .filter((profile) => profile.compatible);
+    if (compatibleProfiles.length === 0) {
+      new Notice("Local Gate: no compatible profile to apply.");
+      return;
+    }
+    new ProfileSuggestModal(this.app, compatibleProfiles, async (profile) => {
       await this.applyProfile(profile);
     }).open();
   }
@@ -898,8 +1462,38 @@ class LocalGatePlugin extends Plugin {
     };
   }
 
-  toLocalGateAgentId(profile) {
-    return `local-gate-${slugify(profile.id) || slugify(profile.name)}`;
+  toProviderAgentId(provider) {
+    return `local-gate-provider-${slugify(provider) || "local"}`;
+  }
+
+  getPreferredProfileForProvider(provider, compatibleProfiles, preferredProfileId = "") {
+    const scoped = compatibleProfiles.filter((profile) => profile.provider === provider);
+    if (scoped.length === 0) {
+      return null;
+    }
+
+    const requestedId = sanitizeString(preferredProfileId, "");
+    if (requestedId.length > 0) {
+      const requested = scoped.find((profile) => profile.id === requestedId);
+      if (requested) {
+        return requested;
+      }
+    }
+
+    const preferredId = sanitizeString(this.settings.activeProfileByProvider[provider], "");
+    if (preferredId.length > 0) {
+      const match = scoped.find((profile) => profile.id === preferredId);
+      if (match) {
+        return match;
+      }
+    }
+
+    const last = scoped.find((profile) => profile.id === this.settings.lastProfileId);
+    if (last) {
+      return last;
+    }
+
+    return scoped[0];
   }
 
   isLocalOverrideArgs(args) {
@@ -935,8 +1529,34 @@ class LocalGatePlugin extends Plugin {
       changed = true;
     }
 
+    const customAgents = Array.isArray(data.customAgents) ? data.customAgents : [];
+    const normalizedCustomAgents = customAgents.map((agent) => {
+      const item = agent && typeof agent === "object" ? { ...agent } : {};
+      const id = sanitizeString(item.id, "");
+      if (id === this.toProviderAgentId("ollama")) {
+        const nextDisplayName = providerAgentDisplayName("ollama");
+        if (sanitizeString(item.displayName, "") !== nextDisplayName) {
+          item.displayName = nextDisplayName;
+          changed = true;
+        }
+        return item;
+      }
+      if (id === this.toProviderAgentId("lmstudio")) {
+        const nextDisplayName = providerAgentDisplayName("lmstudio");
+        if (sanitizeString(item.displayName, "") !== nextDisplayName) {
+          item.displayName = nextDisplayName;
+          changed = true;
+        }
+        return item;
+      }
+      return agent;
+    });
     if (changed) {
-      await this.app.vault.adapter.write(path, `${JSON.stringify(data, null, 2)}\n`);
+      data.customAgents = normalizedCustomAgents;
+    }
+
+    if (changed) {
+      await this.persistAgentClientSettings(path, data);
       if (wasLocalOverride) {
         new Notice("Local Gate: restored built-in Codex to default (cloud) mode.");
       }
@@ -948,21 +1568,30 @@ class LocalGatePlugin extends Plugin {
 
   async applyProfile(profile) {
     const normalized = sanitizeProfile(profile, 0);
-    const saved = this.upsertProfile(normalized);
-    this.settings.lastProfileId = saved.id;
-    await this.saveSettings();
-
-    const preferredAgentId = this.toLocalGateAgentId(saved);
-    if (this.settings.publishProfilesToAgentClient) {
-      await this.syncProfilesToAgentClientAgents(true, preferredAgentId);
-    } else {
-      const path = normalizePath(this.settings.agentClientSettingsPath);
-      const data = await this.readOrCreateAgentClientSettings(path);
-      data.defaultAgentId = preferredAgentId;
-      await this.app.vault.adapter.write(path, `${JSON.stringify(data, null, 2)}\n`);
+    if (!normalized.compatible) {
+      new Notice(`Local Gate: "${normalized.name}" blocked (${normalized.compatibilityReason}).`);
+      return;
     }
 
-    new Notice(`Local Gate: applied "${saved.name}" as active local agent.`);
+    const saved = this.upsertProfile(normalized);
+    this.settings.lastProfileId = saved.id;
+    this.settings.activeProfileByProvider[saved.provider] = saved.id;
+    await this.saveSettings();
+
+    const preferredAgentId = this.toProviderAgentId(saved.provider);
+    if (this.settings.publishProfilesToAgentClient) {
+      await this.syncProfilesToAgentClientAgents(true, preferredAgentId, {
+        [saved.provider]: saved.id,
+      });
+      await this.enforceProviderAgentModel(saved);
+    } else {
+      new Notice("Local Gate: enable 'Publish profiles to Agent Client' to apply local model.");
+      return;
+    }
+
+    new Notice(
+      `Local Gate: applied ${providerLabel(saved.provider)} default model -> ${sanitizeString(saved.model, saved.name)}.`
+    );
   }
 
   async deleteProfile(profileId) {
@@ -978,6 +1607,16 @@ class LocalGatePlugin extends Plugin {
     if (!this.settings.profiles.find((profile) => profile.id === this.settings.lastProfileId)) {
       this.settings.lastProfileId = this.settings.profiles[0].id;
     }
+    Object.entries(this.settings.activeProfileByProvider).forEach(([provider, savedId]) => {
+      if (savedId === profileId) {
+        const next = this.settings.profiles.find((profile) => profile.provider === provider && profile.compatible);
+        if (next) {
+          this.settings.activeProfileByProvider[provider] = next.id;
+        } else {
+          delete this.settings.activeProfileByProvider[provider];
+        }
+      }
+    });
     await this.saveSettings();
     new Notice("Local Gate: profile deleted.");
     if (this.settings.publishProfilesToAgentClient) {
@@ -1000,6 +1639,7 @@ class LocalGatePlugin extends Plugin {
       id: idBase,
       name: `${providerLabel(provider)}: ${modelName}`,
       provider,
+      model: modelName,
       endpoint,
       capabilities: inferModelCapabilities(provider, modelName, sanitizeStringArray(model.capabilities)),
       command: this.settings.codexAcpCommand || "codex-acp",
@@ -1046,6 +1686,7 @@ class LocalGatePlugin extends Plugin {
     const created = this.createProfileFromDiscovered(model);
     const saved = this.upsertProfile(created);
     this.settings.lastProfileId = saved.id;
+    this.settings.activeProfileByProvider[saved.provider] = saved.id;
     await this.saveSettings();
     new Notice(`Local Gate: profile saved (${saved.name}).`);
     if (this.settings.publishProfilesToAgentClient) {
@@ -1096,10 +1737,19 @@ class LocalGatePlugin extends Plugin {
       }
     }
 
-    this.settings.discoveredModels = normalizeDiscoveredModels(found).map((model) => ({
-      ...model,
-      capabilities: inferModelCapabilities(model.provider, model.model, model.capabilities),
-    }));
+    this.settings.discoveredModels = normalizeDiscoveredModels(found).map((model, index) =>
+      sanitizeDiscoveredModel(
+        {
+          ...model,
+          capabilities: inferModelCapabilities(model.provider, model.model, model.capabilities),
+        },
+        index
+      )
+    );
+    const discoveredKeys = new Set(this.settings.discoveredModels.map((model) => model.key));
+    this.settings.hiddenDiscoveredModelKeys = this.settings.hiddenDiscoveredModelKeys.filter((key) =>
+      discoveredKeys.has(key)
+    );
     this.settings.lastScanErrors = errors;
     this.settings.lastScanAt = new Date().toLocaleString();
     this.settings.lastScanSummary = `Discovered ${this.settings.discoveredModels.length} model(s).`;
@@ -1281,38 +1931,194 @@ class LocalGatePlugin extends Plugin {
     throw new Error(lastError || "LM Studio endpoint not reachable");
   }
 
-  async syncProfilesToAgentClientAgents(silent = false, preferredDefaultAgentId = "") {
+  getProviderEndpoint(provider, preferredProfile) {
+    const fromProfile = sanitizeString(preferredProfile && preferredProfile.endpoint, "");
+    if (fromProfile.length > 0) {
+      return fromProfile;
+    }
+    if (provider === "lmstudio") {
+      return toOpenAiEndpoint("lmstudio", this.settings.lmStudioBaseUrl);
+    }
+    if (provider === "ollama") {
+      return toOpenAiEndpoint("ollama", this.settings.ollamaBaseUrl);
+    }
+    return "";
+  }
+
+  async enforceProviderAgentModel(profile) {
+    const normalized = sanitizeProfile(profile, 0);
+    const provider = sanitizeString(normalized.provider, "");
+    const model = sanitizeString(normalized.model, deriveModelName(normalized));
+    if (!provider || !model) {
+      return;
+    }
+
+    const path = normalizePath(this.settings.agentClientSettingsPath);
+    const data = await this.readOrCreateAgentClientSettings(path);
+    const customAgents = Array.isArray(data.customAgents) ? data.customAgents : [];
+    const targetId = this.toProviderAgentId(provider);
+    const targetIndex = customAgents.findIndex((agent) => sanitizeString(agent && agent.id, "") === targetId);
+    if (targetIndex < 0) {
+      return;
+    }
+
+    const launch = await this.buildCodexAcpLaunchSpec(this.settings.codexAcpCommand || "codex-acp");
+    const endpoint = this.getProviderEndpoint(provider, normalized);
+    const nextArgs = [...launch.argsPrefix, ...buildProviderCodexArgs(provider, endpoint, model)];
+    const existing = customAgents[targetIndex] || {};
+    const nextEnv = sanitizeStringArray(existing.env);
+    if (!nextEnv.some((entry) => entry.startsWith("PATH="))) {
+      nextEnv.unshift(`PATH=${buildExecPathEnv()}`);
+    }
+
+    customAgents[targetIndex] = {
+      ...existing,
+      id: targetId,
+      displayName: providerAgentDisplayName(provider),
+      command: launch.command,
+      args: nextArgs,
+      env: nextEnv,
+    };
+    data.customAgents = customAgents;
+    if (launch.nodePath) {
+      data.nodePath = launch.nodePath;
+    }
+    await this.persistAgentClientSettings(path, data);
+  }
+
+  async updateAgentClientRuntime(settingsObject) {
+    const plugin = this.app && this.app.plugins && this.app.plugins.plugins
+      ? this.app.plugins.plugins["agent-client"]
+      : null;
+    if (!plugin) {
+      return false;
+    }
+
+    const nextSettings = clone(settingsObject);
+    try {
+      if (typeof plugin.saveSettingsAndNotify === "function") {
+        await plugin.saveSettingsAndNotify(nextSettings);
+        return true;
+      }
+    } catch (_error) {
+    }
+
+    try {
+      plugin.settings = nextSettings;
+      if (typeof plugin.ensureDefaultAgentId === "function") {
+        plugin.ensureDefaultAgentId();
+      }
+      if (plugin.settingsStore && typeof plugin.settingsStore.set === "function") {
+        plugin.settingsStore.set(plugin.settings);
+      }
+      if (typeof plugin.saveSettings === "function") {
+        await plugin.saveSettings();
+      } else if (typeof plugin.saveData === "function") {
+        await plugin.saveData(plugin.settings);
+      }
+      return true;
+    } catch (_error) {
+    }
+
+    try {
+      if (typeof plugin.loadSettings === "function") {
+        await plugin.loadSettings();
+        if (plugin.settingsStore && typeof plugin.settingsStore.set === "function") {
+          plugin.settingsStore.set(plugin.settings);
+        }
+        return true;
+      }
+    } catch (_error) {
+    }
+
+    return false;
+  }
+
+  async persistAgentClientSettings(path, data) {
+    await this.updateAgentClientRuntime(data);
+    await this.app.vault.adapter.write(path, `${JSON.stringify(data, null, 2)}\n`);
+  }
+
+  async syncProfilesToAgentClientAgents(
+    silent = false,
+    preferredDefaultAgentId = "",
+    preferredProfileIdsByProvider = {}
+  ) {
     const path = normalizePath(this.settings.agentClientSettingsPath);
     const data = await this.readOrCreateAgentClientSettings(path);
     const customAgents = Array.isArray(data.customAgents) ? data.customAgents : [];
     const kept = customAgents.filter((agent) => !String(agent && agent.id || "").startsWith("local-gate-"));
 
     const launch = await this.buildCodexAcpLaunchSpec(this.settings.codexAcpCommand || "codex-acp");
-    const generated = this.settings.profiles.map((profile) => {
-      const baseEnv = sanitizeStringArray(profile.env);
-      if (!baseEnv.some((entry) => entry.startsWith("PATH="))) {
-        baseEnv.unshift(`PATH=${buildExecPathEnv()}`);
+    const normalizedProfiles = this.settings.profiles.map((profile, index) => sanitizeProfile(profile, index));
+    const compatibleProfiles = normalizedProfiles.filter((profile) => profile.compatible);
+    const supportedProviders = ["ollama", "lmstudio"];
+    const providersToGenerate = supportedProviders.filter((provider) =>
+      compatibleProfiles.some((profile) => profile.provider === provider)
+    );
+
+    const generated = providersToGenerate
+      .map((provider) => {
+        const preferredProfile = this.getPreferredProfileForProvider(
+          provider,
+          compatibleProfiles,
+          preferredProfileIdsByProvider[provider]
+        );
+        if (!preferredProfile) {
+          return null;
+        }
+        const selectedModel = sanitizeString(preferredProfile.model, deriveModelName(preferredProfile));
+        const endpoint = this.getProviderEndpoint(provider, preferredProfile);
+        const baseEnv = sanitizeStringArray(preferredProfile.env);
+        if (!baseEnv.some((entry) => entry.startsWith("PATH="))) {
+          baseEnv.unshift(`PATH=${buildExecPathEnv()}`);
+        }
+
+        this.settings.activeProfileByProvider[provider] = preferredProfile.id;
+        return {
+          id: this.toProviderAgentId(provider),
+          displayName: providerAgentDisplayName(provider),
+          command: launch.command,
+          args: [...launch.argsPrefix, ...buildProviderCodexArgs(provider, endpoint, selectedModel)],
+          env: baseEnv,
+        };
+      })
+      .filter(Boolean);
+
+    Object.keys(this.settings.activeProfileByProvider).forEach((provider) => {
+      if (!providersToGenerate.includes(provider)) {
+        delete this.settings.activeProfileByProvider[provider];
       }
-      return {
-        id: this.toLocalGateAgentId(profile),
-        displayName: `[Local] ${profile.name}`,
-        command: launch.command,
-        args: [...launch.argsPrefix, ...sanitizeStringArray(profile.args)],
-        env: baseEnv,
-      };
     });
 
     data.customAgents = [...kept, ...generated];
-    if (preferredDefaultAgentId && generated.some((agent) => agent.id === preferredDefaultAgentId)) {
+    const generatedIds = new Set(generated.map((agent) => agent.id));
+
+    if (preferredDefaultAgentId && generatedIds.has(preferredDefaultAgentId)) {
       data.defaultAgentId = preferredDefaultAgentId;
+    } else if (
+      sanitizeString(data.defaultAgentId, "").startsWith("local-gate-") &&
+      !generatedIds.has(data.defaultAgentId)
+    ) {
+      data.defaultAgentId = "codex-acp";
+    } else if (!sanitizeString(data.defaultAgentId, "").startsWith("local-gate-") && generated.length > 0) {
+      const preferredProvider = compatibleProfiles.find((profile) => profile.id === this.settings.lastProfileId)?.provider;
+      const preferredProviderAgent = preferredProvider ? this.toProviderAgentId(preferredProvider) : "";
+      data.defaultAgentId = generatedIds.has(preferredProviderAgent) ? preferredProviderAgent : generated[0].id;
     }
+
     if (launch.nodePath) {
       data.nodePath = launch.nodePath;
     }
-    await this.app.vault.adapter.write(path, `${JSON.stringify(data, null, 2)}\n`);
+    await this.persistAgentClientSettings(path, data);
+    await this.saveSettings();
 
     if (!silent) {
-      new Notice(`Local Gate: synced ${generated.length} model agent(s) to Agent Client.`);
+      const skipped = normalizedProfiles.length - compatibleProfiles.length;
+      new Notice(
+        `Local Gate: synced ${generated.length} provider agent(s) to Agent Client.` +
+          (skipped > 0 ? ` Skipped ${skipped} incompatible profile(s).` : "")
+      );
     }
   }
 
