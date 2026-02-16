@@ -1100,7 +1100,14 @@ class LocalGatePlugin extends Plugin {
       if (this.settings.scanOnStartup) {
         await this.scanAndStoreModels({ silent: true });
       }
+      this.patchAgentClientModelPicker();
     });
+
+    this.registerInterval(
+      window.setInterval(() => {
+        this.patchAgentClientModelPicker();
+      }, 3000)
+    );
   }
 
   async loadSettings() {
@@ -2113,6 +2120,387 @@ class LocalGatePlugin extends Plugin {
     };
   }
 
+  normalizeModelOptionKey(rawModel) {
+    return sanitizeString(rawModel, "")
+      .replace(/\s+\((low|medium|high|xhigh)\)$/i, "")
+      .trim();
+  }
+
+  extractModelKeyFromOption(option) {
+    if (typeof option === "string") {
+      return sanitizeString(option, "");
+    }
+    if (!option || typeof option !== "object") {
+      return "";
+    }
+
+    const keys = ["id", "value", "model", "name", "label", "text", "title"];
+    for (const key of keys) {
+      const value = sanitizeString(option[key], "");
+      if (value) {
+        return value;
+      }
+    }
+
+    if (option.model && typeof option.model === "object") {
+      const nested = sanitizeString(option.model.id || option.model.name || option.model.value, "");
+      if (nested) {
+        return nested;
+      }
+    }
+
+    return "";
+  }
+
+  optionMatchesAllowedModel(option, allowedModels) {
+    const extracted = this.normalizeModelOptionKey(this.extractModelKeyFromOption(option));
+    if (!extracted) {
+      return false;
+    }
+
+    return allowedModels.some((model) => {
+      const normalizedAllowed = this.normalizeModelOptionKey(model);
+      if (!normalizedAllowed) {
+        return false;
+      }
+      return (
+        extracted === normalizedAllowed ||
+        extracted.includes(normalizedAllowed) ||
+        normalizedAllowed.includes(extracted)
+      );
+    });
+  }
+
+  buildModelOptionFromTemplate(template, model) {
+    if (typeof template === "string" || !template || typeof template !== "object") {
+      return model;
+    }
+
+    const next = { ...template };
+    const textKeys = ["id", "value", "model", "name", "label", "text", "title"];
+    textKeys.forEach((key) => {
+      if (typeof next[key] === "string") {
+        next[key] = model;
+      }
+    });
+    if (next.model && typeof next.model === "object") {
+      const modelObj = { ...next.model };
+      if (typeof modelObj.id === "string") {
+        modelObj.id = model;
+      }
+      if (typeof modelObj.name === "string") {
+        modelObj.name = model;
+      }
+      if (typeof modelObj.value === "string") {
+        modelObj.value = model;
+      }
+      next.model = modelObj;
+    }
+    return next;
+  }
+
+  filterModelOptionArray(options, allowedModels) {
+    if (!Array.isArray(options)) {
+      return options;
+    }
+    const allowed = sanitizeStringArray(allowedModels).map((item) => this.normalizeModelOptionKey(item)).filter(Boolean);
+    if (allowed.length === 0) {
+      return options;
+    }
+
+    const filtered = options.filter((option) => this.optionMatchesAllowedModel(option, allowed));
+    if (filtered.length > 0) {
+      return filtered;
+    }
+
+    const template = options.find((entry) => entry != null);
+    return allowed.map((model) => this.buildModelOptionFromTemplate(template, model));
+  }
+
+  filterModelPayload(payload, allowedModels) {
+    if (Array.isArray(payload)) {
+      return this.filterModelOptionArray(payload, allowedModels);
+    }
+    if (!payload || typeof payload !== "object") {
+      return payload;
+    }
+
+    const next = { ...payload };
+    const arrayKeys = ["models", "availableModels", "modelOptions", "options", "items", "data", "list"];
+    let touched = false;
+    arrayKeys.forEach((key) => {
+      if (Array.isArray(next[key])) {
+        next[key] = this.filterModelOptionArray(next[key], allowedModels);
+        touched = true;
+      }
+    });
+
+    const allowed = sanitizeStringArray(allowedModels).map((item) => this.normalizeModelOptionKey(item)).filter(Boolean);
+    const preferred = allowed[0] || "";
+    if (preferred) {
+      const selectedKeys = ["model", "selectedModel", "modelId", "selectedModelId", "currentModel", "currentModelId"];
+      selectedKeys.forEach((key) => {
+        if (typeof next[key] === "string") {
+          const current = this.normalizeModelOptionKey(next[key]);
+          if (!allowed.some((item) => current === item || current.includes(item) || item.includes(current))) {
+            next[key] = preferred;
+            touched = true;
+          }
+        }
+      });
+    }
+
+    return touched ? next : payload;
+  }
+
+  detectProviderFromAgentId(agentId) {
+    const id = sanitizeString(agentId, "").toLowerCase();
+    if (id.includes("ollama")) {
+      return "ollama";
+    }
+    if (id.includes("lmstudio")) {
+      return "lmstudio";
+    }
+    return "";
+  }
+
+  detectProviderFromDisplayName(displayName) {
+    const lowered = sanitizeString(displayName, "").toLowerCase();
+    if (lowered.includes("ollama")) {
+      return "ollama";
+    }
+    if (lowered.includes("lm studio") || lowered.includes("lmstudio")) {
+      return "lmstudio";
+    }
+    return "";
+  }
+
+  detectProviderFromModelName(modelName) {
+    const model = sanitizeString(modelName, "");
+    if (!model) {
+      return "";
+    }
+
+    const discovered = this.settings.discoveredModels.find((entry) => sanitizeString(entry.model, "") === model);
+    if (discovered) {
+      return sanitizeString(discovered.provider, "");
+    }
+
+    const profile = this.settings.profiles
+      .map((entry, index) => sanitizeProfile(entry, index))
+      .find((entry) => sanitizeString(entry.model, deriveModelName(entry)) === model);
+    if (profile) {
+      return sanitizeString(profile.provider, "");
+    }
+
+    if (model.includes(":")) {
+      return "ollama";
+    }
+    return "";
+  }
+
+  getCurrentModelFromView(view) {
+    if (!view) {
+      return "";
+    }
+
+    const methodNames = ["getSelectedModel", "getCurrentModel", "getModel", "getModelId"];
+    for (const methodName of methodNames) {
+      const fn = view[methodName];
+      if (typeof fn !== "function") {
+        continue;
+      }
+      try {
+        const result = fn.call(view);
+        if (typeof result === "string") {
+          return sanitizeString(result, "");
+        }
+        if (result && typeof result === "object") {
+          const nested = sanitizeString(result.id || result.model || result.name || result.value, "");
+          if (nested) {
+            return nested;
+          }
+        }
+      } catch (_error) {
+      }
+    }
+
+    const directKeys = ["selectedModel", "currentModel", "model", "selectedModelId", "currentModelId", "modelId"];
+    for (const key of directKeys) {
+      const raw = view[key];
+      if (typeof raw === "string") {
+        const value = sanitizeString(raw, "");
+        if (value) {
+          return value;
+        }
+      } else if (raw && typeof raw === "object") {
+        const nested = sanitizeString(raw.id || raw.model || raw.name || raw.value, "");
+        if (nested) {
+          return nested;
+        }
+      }
+    }
+
+    if (typeof view.getInputState === "function") {
+      try {
+        const state = view.getInputState() || {};
+        const fromState = sanitizeString(state.model || state.modelId, "");
+        if (fromState) {
+          return fromState;
+        }
+      } catch (_error) {
+      }
+    }
+
+    return "";
+  }
+
+  getCurrentAgentFromView(view) {
+    if (!view) {
+      return null;
+    }
+
+    const methodNames = ["getSelectedAgent", "getCurrentAgent", "getAgent", "getActiveAgent"];
+    for (const methodName of methodNames) {
+      const fn = view[methodName];
+      if (typeof fn !== "function") {
+        continue;
+      }
+      try {
+        const result = fn.call(view);
+        if (result && typeof result === "object") {
+          return result;
+        }
+      } catch (_error) {
+      }
+    }
+
+    const directKeys = ["selectedAgent", "currentAgent", "agent", "activeAgent"];
+    for (const key of directKeys) {
+      const value = view[key];
+      if (value && typeof value === "object") {
+        return value;
+      }
+    }
+
+    return null;
+  }
+
+  resolveProviderForView(view) {
+    const currentAgent = this.getCurrentAgentFromView(view);
+    const directAgentIdKeys = ["selectedAgentId", "currentAgentId", "agentId", "activeAgentId"];
+    for (const key of directAgentIdKeys) {
+      const provider = this.detectProviderFromAgentId(sanitizeString(view && view[key], ""));
+      if (provider) {
+        return provider;
+      }
+    }
+
+    if (currentAgent) {
+      const fromId = this.detectProviderFromAgentId(sanitizeString(currentAgent.id || currentAgent.agentId, ""));
+      if (fromId) {
+        return fromId;
+      }
+      const fromName = this.detectProviderFromDisplayName(
+        sanitizeString(currentAgent.displayName || currentAgent.name || currentAgent.label, "")
+      );
+      if (fromName) {
+        return fromName;
+      }
+    }
+
+    const currentModel = this.getCurrentModelFromView(view);
+    return this.detectProviderFromModelName(currentModel);
+  }
+
+  isLocalGateContext(view) {
+    const provider = this.resolveProviderForView(view);
+    if (provider) {
+      return true;
+    }
+    const currentModel = this.getCurrentModelFromView(view);
+    const modelProvider = this.detectProviderFromModelName(currentModel);
+    return modelProvider.length > 0;
+  }
+
+  filterModelResultForLocalContext(view, result) {
+    if (!this.isLocalGateContext(view)) {
+      return result;
+    }
+
+    const currentModel = this.getCurrentModelFromView(view);
+    const provider = this.resolveProviderForView(view) || this.detectProviderFromModelName(currentModel);
+    const allowed = this.getLocalModelsForProvider(provider || "ollama", currentModel);
+    if (allowed.length === 0) {
+      return result;
+    }
+
+    if (result && typeof result.then === "function") {
+      return result
+        .then((resolved) => this.filterModelPayload(resolved, allowed))
+        .catch(() => result);
+    }
+    return this.filterModelPayload(result, allowed);
+  }
+
+  patchModelMethodOnTarget(target, methodName, viewRef = null) {
+    if (!target || typeof target[methodName] !== "function") {
+      return false;
+    }
+
+    const original = target[methodName];
+    if (original.__localGateModelPatched === true) {
+      return false;
+    }
+
+    const plugin = this;
+    const wrapped = function(...args) {
+      const result = original.apply(this, args);
+      const currentView = viewRef || this;
+      return plugin.filterModelResultForLocalContext(currentView, result);
+    };
+    wrapped.__localGateModelPatched = true;
+    wrapped.__localGateOriginal = original;
+    target[methodName] = wrapped;
+    return true;
+  }
+
+  patchAgentClientModelPicker(plugin = this.getAgentClientPlugin()) {
+    if (!plugin) {
+      return false;
+    }
+
+    let patched = false;
+    const methodCandidates = [
+      "getAvailableModels",
+      "getModelOptions",
+      "buildModelOptions",
+      "resolveModelOptions",
+      "listModels",
+      "getModels",
+      "computeModelOptions",
+    ];
+
+    methodCandidates.forEach((methodName) => {
+      if (this.patchModelMethodOnTarget(plugin, methodName, this.getActiveAgentClientChatView())) {
+        patched = true;
+      }
+    });
+
+    const views = typeof plugin.getAllChatViews === "function" ? plugin.getAllChatViews() : [];
+    if (Array.isArray(views)) {
+      views.forEach((view) => {
+        methodCandidates.forEach((methodName) => {
+          if (this.patchModelMethodOnTarget(view, methodName, view)) {
+            patched = true;
+          }
+        });
+      });
+    }
+
+    return patched;
+  }
+
   async enforceProviderAgentModel(profile) {
     const normalized = sanitizeProfile(profile, 0);
     const provider = sanitizeString(normalized.provider, "");
@@ -2168,6 +2556,7 @@ class LocalGatePlugin extends Plugin {
   }
 
   async refreshAgentClientViews(plugin, nextSettings) {
+    this.patchAgentClientModelPicker(plugin);
     let touched = false;
     const pluginMethods = [
       "ensureDefaultAgentId",
@@ -2305,6 +2694,7 @@ class LocalGatePlugin extends Plugin {
     }
 
     if (updated) {
+      this.patchAgentClientModelPicker(plugin);
       await this.refreshAgentClientViews(plugin, nextSettings);
       await this.restartAgentClientSessions(plugin);
     }
