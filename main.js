@@ -156,7 +156,7 @@ function buildProviderCodexArgs(provider, endpoint, model) {
   const providerName = normalizedProvider === "lmstudio" ? "LM Studio" : "Ollama";
   const args = [
     "-c",
-    "features.remote_models=true",
+    "features.remote_models=false",
     "-c",
     `model_provider=${toTomlQuoted(normalizedProvider)}`,
     "-c",
@@ -1283,7 +1283,18 @@ class LocalGatePlugin extends Plugin {
     const files = this.collectMentionFilePaths(folderPaths, filePaths);
     const limit = 80;
     const selected = files.slice(0, limit);
-    const mentions = selected.map((filePath) => `@${this.normalizeMentionPath(filePath)}`).join(" ");
+    const mentions = selected
+      .map((filePath) => {
+        const normalized = this.normalizeMentionPath(filePath);
+        if (!normalized) {
+          return "";
+        }
+        const mention = `@${normalized}`;
+        // Keep both formats together so either @ parser or auto-link path parser can pick it up.
+        return `${mention} [[${normalized}]]`;
+      })
+      .filter(Boolean)
+      .join(" ");
     return {
       mentions,
       count: selected.length,
@@ -1320,32 +1331,139 @@ class LocalGatePlugin extends Plugin {
       }
     }
 
+    const mostRecentLeaf =
+      this.app && this.app.workspace && typeof this.app.workspace.getMostRecentLeaf === "function"
+        ? this.app.workspace.getMostRecentLeaf()
+        : null;
+    if (mostRecentLeaf) {
+      const fromLeaf = views.find((view) => view && view.leaf === mostRecentLeaf);
+      if (fromLeaf) {
+        return fromLeaf;
+      }
+    }
+
+    if (typeof document !== "undefined" && document.activeElement) {
+      const focused = views.find((view) => {
+        const container = view && (view.containerEl || view.contentEl);
+        return container && typeof container.contains === "function" && container.contains(document.activeElement);
+      });
+      if (focused) {
+        return focused;
+      }
+    }
+
     return views[0];
   }
 
-  tryInsertMentionsToActiveChat(mentions) {
+  findChatInputElement(view) {
+    const roots = [view && view.containerEl, view && view.contentEl].filter(Boolean);
+    for (const root of roots) {
+      if (typeof root.querySelector === "function") {
+        const input = root.querySelector("textarea, input[type='text'], [contenteditable='true']");
+        if (input) {
+          return input;
+        }
+      }
+    }
+    return null;
+  }
+
+  triggerChatInputRefresh(view, nextText) {
+    const methods = [
+      "handleInputChange",
+      "onInputChange",
+      "onPromptChange",
+      "scheduleAutoLink",
+      "processAutoLinks",
+      "refreshMentions",
+      "refreshModelList",
+      "refreshModelOptions",
+    ];
+    methods.forEach((methodName) => {
+      const fn = view && view[methodName];
+      if (typeof fn !== "function") {
+        return;
+      }
+      try {
+        if (fn.length >= 1) {
+          fn.call(view, nextText);
+        } else {
+          fn.call(view);
+        }
+      } catch (_error) {
+      }
+    });
+  }
+
+  appendTextViaDomInput(view, text) {
+    const input = this.findChatInputElement(view);
+    if (!input) {
+      return false;
+    }
+
+    const currentValue =
+      "value" in input ? sanitizeString(String(input.value || ""), "") : sanitizeString(input.textContent || "", "");
+    const nextText = currentValue.length > 0 ? `${currentValue}\n${text}` : text;
+
+    if ("value" in input) {
+      input.value = nextText;
+    } else {
+      input.textContent = nextText;
+    }
+
+    try {
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    } catch (_error) {
+    }
+    this.triggerChatInputRefresh(view, nextText);
+    return true;
+  }
+
+  async tryInsertMentionsToActiveChat(mentions) {
     const text = sanitizeString(mentions, "");
     if (text.length === 0) {
       return false;
     }
 
     const view = this.getActiveAgentClientChatView();
-    if (!view || typeof view.getInputState !== "function" || typeof view.setInputState !== "function") {
+    if (!view) {
       return false;
     }
 
-    const current = view.getInputState() || {};
-    const currentText = sanitizeString(current.text, "");
-    const currentImages = Array.isArray(current.images) ? current.images : [];
-    const nextText = currentText.length > 0 ? `${currentText}\n${text}` : text;
-    view.setInputState({ text: nextText, images: currentImages });
-    return true;
+    const insertMethods = ["appendToInput", "appendInputText", "insertTextAtCursor", "insertText", "appendMessageText"];
+    for (const methodName of insertMethods) {
+      const fn = view[methodName];
+      if (typeof fn !== "function") {
+        continue;
+      }
+      try {
+        const result = fn.length >= 1 ? await fn.call(view, text) : await fn.call(view);
+        if (result !== false) {
+          this.triggerChatInputRefresh(view, text);
+          return true;
+        }
+      } catch (_error) {
+      }
+    }
+
+    if (typeof view.getInputState === "function" && typeof view.setInputState === "function") {
+      const current = view.getInputState() || {};
+      const currentText = sanitizeString(current.text, "");
+      const currentImages = Array.isArray(current.images) ? current.images : [];
+      const nextText = currentText.length > 0 ? `${currentText}\n${text}` : text;
+      view.setInputState({ text: nextText, images: currentImages });
+      this.triggerChatInputRefresh(view, nextText);
+      return true;
+    }
+
+    return this.appendTextViaDomInput(view, text);
   }
 
   async copyMentionsAndTryInsertToChat(mentions) {
     await navigator.clipboard.writeText(mentions);
     try {
-      return this.tryInsertMentionsToActiveChat(mentions);
+      return await this.tryInsertMentionsToActiveChat(mentions);
     } catch (_error) {
       return false;
     }
@@ -1945,6 +2063,56 @@ class LocalGatePlugin extends Plugin {
     return "";
   }
 
+  getLocalModelsForProvider(provider, preferredModel = "") {
+    const normalizedProvider = sanitizeString(provider, "");
+    const models = [];
+    const seen = new Set();
+    const addModel = (raw) => {
+      const safe = sanitizeString(raw, "");
+      if (!safe || seen.has(safe)) {
+        return;
+      }
+      seen.add(safe);
+      models.push(safe);
+    };
+
+    addModel(preferredModel);
+
+    sanitizeStringArray(
+      this.settings.discoveredModels
+        .filter((entry) => entry && entry.provider === normalizedProvider && entry.compatible !== false)
+        .map((entry) => entry.model)
+    ).forEach(addModel);
+
+    this.settings.profiles
+      .map((entry, index) => sanitizeProfile(entry, index))
+      .filter((entry) => entry.provider === normalizedProvider && entry.compatible)
+      .map((entry) => sanitizeString(entry.model, deriveModelName(entry)))
+      .forEach(addModel);
+
+    return models.slice(0, 80);
+  }
+
+  buildAgentModelHintFields(provider, selectedModel) {
+    const model = sanitizeString(selectedModel, "");
+    const models = this.getLocalModelsForProvider(provider, model);
+    if (model.length === 0 && models.length === 0) {
+      return {};
+    }
+    const effectiveModel = model.length > 0 ? model : models[0];
+    const effectiveModels = models.length > 0 ? models : [effectiveModel];
+    return {
+      model: effectiveModel,
+      defaultModel: effectiveModel,
+      preferredModel: effectiveModel,
+      selectedModel: effectiveModel,
+      models: effectiveModels,
+      availableModels: effectiveModels,
+      modelOptions: effectiveModels,
+      availableModelIds: effectiveModels,
+    };
+  }
+
   async enforceProviderAgentModel(profile) {
     const normalized = sanitizeProfile(profile, 0);
     const provider = sanitizeString(normalized.provider, "");
@@ -1978,12 +2146,112 @@ class LocalGatePlugin extends Plugin {
       command: launch.command,
       args: nextArgs,
       env: nextEnv,
+      ...this.buildAgentModelHintFields(provider, model),
     };
     data.customAgents = customAgents;
     if (launch.nodePath) {
       data.nodePath = launch.nodePath;
     }
     await this.persistAgentClientSettings(path, data);
+  }
+
+  async callOptionalMethod(target, methodName, args = []) {
+    if (!target || typeof target[methodName] !== "function") {
+      return false;
+    }
+    try {
+      await target[methodName](...args);
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  async refreshAgentClientViews(plugin, nextSettings) {
+    let touched = false;
+    const pluginMethods = [
+      "ensureDefaultAgentId",
+      "notifySettingsChanged",
+      "notifySettingsUpdated",
+      "refreshAgents",
+      "refreshAgentList",
+      "refreshViews",
+      "rerenderViews",
+    ];
+    for (const methodName of pluginMethods) {
+      const args = methodName.toLowerCase().includes("settings") ? [nextSettings] : [];
+      if (await this.callOptionalMethod(plugin, methodName, args)) {
+        touched = true;
+      }
+    }
+
+    if (plugin.settingsStore && typeof plugin.settingsStore.set === "function") {
+      try {
+        plugin.settingsStore.set(plugin.settings || nextSettings);
+        touched = true;
+      } catch (_error) {
+      }
+    }
+
+    const views = typeof plugin.getAllChatViews === "function" ? plugin.getAllChatViews() : [];
+    if (Array.isArray(views)) {
+      const viewMethods = [
+        "onSettingsUpdated",
+        "refreshAgentOptions",
+        "refreshModelOptions",
+        "refreshModelList",
+        "refreshMentions",
+        "processAutoLinks",
+        "requestUpdate",
+        "render",
+      ];
+      for (const view of views) {
+        for (const methodName of viewMethods) {
+          const args = methodName === "onSettingsUpdated" ? [plugin.settings || nextSettings] : [];
+          if (await this.callOptionalMethod(view, methodName, args)) {
+            touched = true;
+          }
+        }
+      }
+    }
+
+    return touched;
+  }
+
+  async restartAgentClientSessions(plugin) {
+    let restarted = false;
+    const pluginRestartMethods = [
+      "restartAgent",
+      "restartCurrentAgent",
+      "restartActiveAgent",
+      "restartDefaultAgent",
+      "reloadActiveAgent",
+      "reloadAgentRuntime",
+    ];
+    for (const methodName of pluginRestartMethods) {
+      if (await this.callOptionalMethod(plugin, methodName, [])) {
+        restarted = true;
+      }
+    }
+
+    const views = typeof plugin.getAllChatViews === "function" ? plugin.getAllChatViews() : [];
+    if (Array.isArray(views)) {
+      const viewRestartMethods = [
+        "restartAgent",
+        "restartSession",
+        "restartCurrentAgent",
+        "reconnectAgent",
+      ];
+      for (const view of views) {
+        for (const methodName of viewRestartMethods) {
+          if (await this.callOptionalMethod(view, methodName, [])) {
+            restarted = true;
+          }
+        }
+      }
+    }
+
+    return restarted;
   }
 
   async updateAgentClientRuntime(settingsObject) {
@@ -1995,43 +2263,53 @@ class LocalGatePlugin extends Plugin {
     }
 
     const nextSettings = clone(settingsObject);
+    let updated = false;
     try {
       if (typeof plugin.saveSettingsAndNotify === "function") {
         await plugin.saveSettingsAndNotify(nextSettings);
-        return true;
+        updated = true;
       }
     } catch (_error) {
     }
 
-    try {
-      plugin.settings = nextSettings;
-      if (typeof plugin.ensureDefaultAgentId === "function") {
-        plugin.ensureDefaultAgentId();
-      }
-      if (plugin.settingsStore && typeof plugin.settingsStore.set === "function") {
-        plugin.settingsStore.set(plugin.settings);
-      }
-      if (typeof plugin.saveSettings === "function") {
-        await plugin.saveSettings();
-      } else if (typeof plugin.saveData === "function") {
-        await plugin.saveData(plugin.settings);
-      }
-      return true;
-    } catch (_error) {
-    }
-
-    try {
-      if (typeof plugin.loadSettings === "function") {
-        await plugin.loadSettings();
+    if (!updated) {
+      try {
+        plugin.settings = nextSettings;
+        if (typeof plugin.ensureDefaultAgentId === "function") {
+          plugin.ensureDefaultAgentId();
+        }
         if (plugin.settingsStore && typeof plugin.settingsStore.set === "function") {
           plugin.settingsStore.set(plugin.settings);
         }
-        return true;
+        if (typeof plugin.saveSettings === "function") {
+          await plugin.saveSettings();
+        } else if (typeof plugin.saveData === "function") {
+          await plugin.saveData(plugin.settings);
+        }
+        updated = true;
+      } catch (_error) {
       }
-    } catch (_error) {
     }
 
-    return false;
+    if (!updated) {
+      try {
+        if (typeof plugin.loadSettings === "function") {
+          await plugin.loadSettings();
+          if (plugin.settingsStore && typeof plugin.settingsStore.set === "function") {
+            plugin.settingsStore.set(plugin.settings);
+          }
+          updated = true;
+        }
+      } catch (_error) {
+      }
+    }
+
+    if (updated) {
+      await this.refreshAgentClientViews(plugin, nextSettings);
+      await this.restartAgentClientSessions(plugin);
+    }
+
+    return updated;
   }
 
   async persistAgentClientSettings(path, data) {
@@ -2081,6 +2359,7 @@ class LocalGatePlugin extends Plugin {
           command: launch.command,
           args: [...launch.argsPrefix, ...buildProviderCodexArgs(provider, endpoint, selectedModel)],
           env: baseEnv,
+          ...this.buildAgentModelHintFields(provider, selectedModel),
         };
       })
       .filter(Boolean);
