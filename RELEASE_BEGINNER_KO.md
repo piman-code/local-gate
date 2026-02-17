@@ -1,6 +1,6 @@
 # Local Gate 초보자용 커밋/릴리즈 실행 가이드
 
-이번 문서는 `/Users/piman/Documents/AI/obsidian-plugin/local-gate` 기준으로 작성되었습니다.
+이번 문서는 `<PLUGIN_ROOT>/local-gate` 기준으로 작성되었습니다.
 
 ## 0) 먼저 큰 그림 이해하기 (파인만 기법)
 
@@ -41,11 +41,11 @@
 ### Step A. 작업 폴더로 이동
 
 ```bash
-cd /Users/piman/Documents/AI/obsidian-plugin/local-gate
+cd <PLUGIN_ROOT>/local-gate
 ```
 
 [명령어 설명]  
-명령: `cd /Users/piman/Documents/AI/obsidian-plugin/local-gate`  
+명령: `cd <PLUGIN_ROOT>/local-gate`  
 1) 한 줄 정의: 터미널의 현재 작업 위치를 플러그인 폴더로 이동합니다.  
 2) 쉬운 비유: 작업할 공방으로 들어가는 동작입니다.  
 3) 작은 예시(이번 작업 맥락): Local Gate 파일을 정확히 이 폴더에서 다루게 됩니다.  
@@ -117,12 +117,12 @@ rg -n "(api[_-]?key|token|password|secret|\\.env|@gmail\\.com|010-[0-9]{4}-[0-9]
    - 판단: **오탐 가능성 큼** (즉시 유출로 단정 금지)
 
 3. 실제 값처럼 보이는 문자열이 보임  
-   - 예시: `"apiKey": "sk-..."`, `token: "ghp_..."`, `password: "..."`  
+   - 예시: `"credentialField": "<EXAMPLE_VALUE>"`, `"authField": "<EXAMPLE_VALUE>"`  
    - 의미: 비밀값 하드코딩 가능성  
    - 판단: **위험** (릴리즈 중단 후 제거/치환 필요)
 
 4. 개인식별정보(이메일/전화)가 보임  
-   - 예시: `name@gmail.com`, `010-1234-5678`  
+   - 예시: `<user@example.com>`, `<010-XXXX-XXXX>`  
    - 의미: 개인정보 포함 가능성  
    - 판단: **위험** (익명화/삭제 후 재검사)
 

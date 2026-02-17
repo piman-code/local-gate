@@ -1,6 +1,30 @@
 .local-gate-settings .local-gate-subtitle {
   opacity: 0.85;
   margin-top: -6px;
+  line-height: 1.45;
+  max-width: 920px;
+}
+
+.local-gate-settings .local-gate-lang-tabs {
+  display: inline-flex;
+  gap: 6px;
+  margin: 6px 0 12px;
+  padding: 4px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--background-primary) 84%, var(--background-modifier-hover) 16%);
+}
+
+.local-gate-settings .local-gate-lang-tabs > button {
+  border-radius: 8px;
+  min-width: 54px;
+  padding: 4px 10px;
+}
+
+.local-gate-settings .local-gate-lang-tabs > button.local-gate-lang-tab-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: color-mix(in srgb, var(--interactive-accent) 86%, black 14%);
 }
 
 .local-gate-settings .local-gate-section {
@@ -17,17 +41,121 @@
 
 .local-gate-settings .local-gate-section > h3 {
   margin: 0 0 8px;
+  letter-spacing: 0.01em;
 }
 
 .local-gate-settings .local-gate-meta,
 .local-gate-settings .local-gate-empty {
   margin: 0 0 10px;
   color: var(--text-muted);
+  line-height: 1.4;
 }
 
 .local-gate-settings .local-gate-error {
   margin: 0 0 10px;
   color: var(--text-error);
+  line-height: 1.4;
+}
+
+.local-gate-settings .setting-item {
+  padding-top: 9px;
+  padding-bottom: 9px;
+}
+
+.local-gate-settings .setting-item-name {
+  font-weight: 620;
+  letter-spacing: 0.01em;
+}
+
+.local-gate-settings .setting-item-description {
+  line-height: 1.5;
+  max-width: 960px;
+}
+
+.local-gate-settings .local-gate-desc-main {
+  line-height: 1.4;
+}
+
+.local-gate-settings .local-gate-desc-hint {
+  display: block;
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.35;
+  opacity: 0.96;
+}
+
+.local-gate-settings .setting-item-control button {
+  white-space: nowrap;
+}
+
+.local-gate-chat-tools {
+  margin: 4px 0 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--background-primary) 88%, var(--interactive-accent) 12%);
+}
+
+.local-gate-chat-tool-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.local-gate-chat-tool-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 8px;
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.local-gate-chat-tool-btn .local-gate-chat-tool-label {
+  font-size: 11px;
+}
+
+.local-gate-chat-selection {
+  margin-top: 6px;
+}
+
+.local-gate-chat-selection > summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.2;
+  user-select: none;
+}
+
+.local-gate-chat-selection-body {
+  margin-top: 5px;
+  padding-top: 4px;
+  border-top: 1px dashed color-mix(in srgb, var(--background-modifier-border) 74%, transparent);
+}
+
+.local-gate-chat-selection-meta {
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.25;
+  margin-bottom: 4px;
+}
+
+.local-gate-chat-selection-list {
+  margin: 0;
+  padding-left: 16px;
+  max-height: 98px;
+  overflow: auto;
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+.local-gate-chat-selection-empty,
+.local-gate-chat-selection-more {
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.25;
 }
 
 .local-gate-settings .local-gate-model-row,
@@ -35,6 +163,20 @@
   border-left: 3px solid color-mix(in srgb, var(--interactive-accent) 70%, transparent);
   padding-left: 8px;
   margin: 6px 0;
+}
+
+.local-gate-settings .local-gate-model-group {
+  margin-top: 10px;
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 6px;
+}
+
+.local-gate-settings .local-gate-model-group > h4 {
+  margin: 2px 0 6px;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
 }
 
 .local-gate-settings .local-gate-row-unsupported {

@@ -57,6 +57,13 @@ Local Gate는 Obsidian에서 로컬 AI 모델(Ollama / LM Studio)을 검색하�
 
 - 모델이 스캔되는데 적용이 안 되는 경우
   - `blocked` 사유를 확인하세요. (`embedding-only`, `no tools capability` 등)
+- 간단한 질문인데 Thinking/툴 호출이 과도한 경우
+  - `Context Pack force tool-less send (inline mode)`를 ON으로 유지하세요.
+  - `Suppress thinking/reasoning signals (best effort)`를 ON으로 두면 요청 플래그 수준의 노이즈를 줄일 수 있습니다.
+  - 참고: Thinking 카드 UI 자체는 Agent Client 렌더링 정책 영향이 있어 Local Gate만으로 완전 제거는 어렵습니다.
+- Multi Context Pack 입력이 너무 길어지는 경우
+  - `Context Pack include note previews`를 OFF로 유지하세요.
+  - `Context Pack auto-preview by query keywords`를 OFF로 두면 `요약/분석` 질의에서도 장문 미리보기를 자동 주입하지 않습니다.
 - 채팅창에 자동 반영이 안 되는 경우
   - 클립보드 복사는 완료되며, 안내 문구에 `paste manually`가 표시될 수 있습니다.
   - 이 경우 채팅 입력창에 직접 붙여넣으면 정상 동작합니다.

@@ -1,7 +1,7 @@
 {
   "id": "local-gate",
   "name": "Local Gate",
-  "version": "0.3.12",
+  "version": "0.3.13",
   "minAppVersion": "1.5.0",
   "description": "Discover local AI models and switch Codex profiles for Agent Client.",
   "author": "piman",
